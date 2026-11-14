@@ -12,7 +12,7 @@
 
 ![界面示意](docs/images/popup-demo.png)
 
-![托盘图标](docs/images/tray-icons.png)
+![托盘图标](https://github.com/zerobeyondlogic/vgn-battery/raw/refs/heads/main/docs/images/tray-icons.png)
 
 上图为界面和图标的演示图，不是各型号的实机测试截图。
 
