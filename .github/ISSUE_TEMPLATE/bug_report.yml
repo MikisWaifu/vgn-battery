@@ -1,0 +1,33 @@
+name: 电量读取或界面问题
+description: 提供型号、连接方式和复现步骤，帮助确认问题。
+body:
+  - type: input
+    id: version
+    attributes:
+      label: 程序版本 / Windows 版本
+      placeholder: v1.0.0 / Windows 11 x64
+    validations:
+      required: true
+  - type: input
+    id: mouse
+    attributes:
+      label: 鼠标和接收器型号
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: 连接方式
+      options:
+        - 2.4G USB 接收器
+        - USB 有线
+        - 蓝牙（当前版本不支持）
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: 问题与复现步骤
+      description: 请说明移动鼠标唤醒后是否仍然灰色。截图只保留本程序；不要整份上传含设备路径的 devices.json。
+    validations:
+      required: true

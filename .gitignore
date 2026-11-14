@@ -1,0 +1,16 @@
+src/bin/
+src/obj/
+dist/
+artifacts/
+releases/
+devices.json
+status.json
+settings.json
+layout.json
+diagnostic.log
+diagnostic-error.txt
+self-test.txt
+icon-preview.png
+menu-preview.png
+.vs/
+*.user
