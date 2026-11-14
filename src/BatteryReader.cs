@@ -116,7 +116,7 @@ internal sealed class BatteryReader
     {
         bool directCable = wired ?? productId == 0xfb3d;
         string transport = directCable ? "USB 有线" : "2.4 GHz USB 接收器";
-        if (report.Length != 17 || report[0] != 8 || report[1] != 4 || report.Sum(b=>(int)b) % 256 != 0x55 || report[6] > 100)
+        if (report.Length != 17 || report[0] != 8 || report[1] != 4 || report[2] != 0 || report.Sum(b=>(int)b) % 256 != 0x55 || report[6] > 100)
             return new(null, false, "电量数据校验未通过", DateTimeOffset.Now, transport);
         // An echoed query / all-zero payload is not a zero-percent battery reading.
         if (report.AsSpan(2, 14).IndexOfAnyExcept((byte)0) < 0)

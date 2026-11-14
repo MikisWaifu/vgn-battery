@@ -10,7 +10,7 @@ internal static class Program
     [STAThread]
     static void Main(string[] args)
     {
-        bool diagnostic = args.Any(a=>a is "--enumerate" or "--query" or "--self-test" or "--icon-preview" or "--menu-preview" or "--ui-preview");
+        bool diagnostic = args.Any(a=>a is "--enumerate" or "--diagnose" or "--query" or "--self-test" or "--icon-preview" or "--menu-preview" or "--ui-preview");
         if (!diagnostic) { Run(args); return; }
         try
         {
@@ -52,6 +52,11 @@ internal static class Program
         if (args.Contains("--enumerate"))
         {
             File.WriteAllText(DiagnosticPath("devices.json"), JsonSerializer.Serialize(NativeHid.Enumerate(), new JsonSerializerOptions { WriteIndented=true }));
+            return;
+        }
+        if (args.Contains("--diagnose"))
+        {
+            File.WriteAllText(DiagnosticPath("device-report.json"),JsonSerializer.Serialize(DeviceDiagnostics.Collect(),new JsonSerializerOptions { WriteIndented=true, Encoder=JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
             return;
         }
         if (args.Contains("--query"))
@@ -188,7 +193,16 @@ internal static class Program
         Check(!StartupRegistration.NeedsMigration(startup,startup),"current startup needs no migration");
         Check(StartupRegistration.MatchesCurrentCommand("  "+startup.ToUpperInvariant()+"  ",startup),"startup command comparison tolerates case and outer spaces");
         Check(!StartupRegistration.MatchesCurrentCommand("\"C:\\OldApp\\VgnBattery.exe\"",startup),"old startup path not reported as current");
-        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 43 protocol, identity, icon, dragging, settings, startup and low battery policy checks. These are offline checks, not hardware validation.");
+        Check(DeviceCatalog.Find(0x391d,0x102d) is { Wired:false },"F2 Master GT receiver registered");
+        Check(DeviceCatalog.Find(0x391d,0x1032) is { Wired:true },"F2 Master GT cable registered");
+        Check(DeviceCatalog.Model(actualName with { VendorId=0x391d,ProductId=0x102d,Product="Compx" },DeviceCatalog.Find(0x391d,0x102d))=="VGN F2 Master GT","GT generic receiver model fallback");
+        Check(DeviceCatalog.Find(0x391d,0xffff) is null,"unknown device from GT vendor not queried");
+        var failedResponse=Frame(55,false); failedResponse[2]=1; failedResponse[16]=0; failedResponse[16]=unchecked((byte)(0x55-failedResponse.Sum(b=>(int)b)));
+        Check(BatteryReader.Parse(failedResponse,0xfb3e).Percent is null,"error response with valid checksum rejected");
+        string shareReport=JsonSerializer.Serialize(DeviceDiagnostics.CreateReport([actualName with { Path="private-device-path-and-serial",VendorId=0x391d,ProductId=0x102d }],[]));
+        Check(!shareReport.Contains("private-device-path-and-serial",StringComparison.Ordinal),"share report omits device path and serial");
+        Check(shareReport.Contains("391D",StringComparison.Ordinal) && shareReport.Contains("102D",StringComparison.Ordinal),"share report retains model identifiers");
+        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 50 protocol, identity, icon, dragging, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
     }
 
     private static void RenderIconPreview()

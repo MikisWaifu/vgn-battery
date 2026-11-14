@@ -4,11 +4,12 @@ internal sealed record DeviceProfile(ushort VendorId, ushort ProductId, string F
 
 internal static class DeviceCatalog
 {
-    // Only documented Nordic52 devices receive the 17-byte battery query.
+    // Only documented CompX/JM devices receive the 17-byte battery query.
     // Product strings remain the primary source of the displayed device name.
     private static readonly DeviceProfile[] Profiles =
     [
         new(0x3554,0xfb3e,"VGN F2 Pro Max",false), new(0x3554,0xfb3d,"VGN F2 Pro Max",true),
+        new(0x391d,0x102d,"VGN F2 Master GT",false), new(0x391d,0x1032,"VGN F2 Master GT",true),
         new(0x3554,0xf503,"VGN F1 Pro",false), new(0x3554,0xf502,"VGN F1 Pro",true),
         new(0x3554,0xf505,"VGN Dragonfly 4K 接收器",false), new(0x3554,0xf506,"VGN Dragonfly 系列有线",true),
         new(0x3554,0xf58a,"VXE R1 Pro / Pro Max",false), new(0x3554,0xf58c,"VXE R1 Pro / Pro Max",true),

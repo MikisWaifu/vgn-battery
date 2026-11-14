@@ -17,12 +17,14 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem startupItem;
     private readonly ToolStripMenuItem percentageItem;
     private readonly ToolStripMenuItem lowBatteryItem;
+    private readonly ToolStripMenuItem exportItem;
     private readonly LowBatteryPolicy lowBatteryPolicy = new();
     private Icon? currentIcon;
     private (int? Percent, bool Charging, bool Digits, bool Light, bool Stale, int Size)? renderedIcon;
     private BatteryView current = new(null, false, "正在查找鼠标…", DateTimeOffset.Now, "");
     private bool refreshing;
     private bool exiting;
+    private bool exporting;
     private bool showPercentage = true;
     private bool lowBatteryEnabled = true;
     private int lowBatteryThreshold = 20;
@@ -73,6 +75,9 @@ internal sealed class TrayApp : ApplicationContext
         startupItem = new ToolStripMenuItem("开机自动运行") { CheckOnClick = true };
         startupItem.Click += (_, _) => SetStartup(startupItem.Checked);
         menu.Items.Add(startupItem);
+        menu.Items.Add(new ToolStripSeparator());
+        exportItem = new ToolStripMenuItem("导出设备信息…", null, async (_, _) => await ExportDeviceInformationAsync());
+        menu.Items.Add(exportItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => ExitThread());
         menu.Opening += (_, _) => SyncPopupSettings();
@@ -180,6 +185,51 @@ internal sealed class TrayApp : ApplicationContext
 
     private void OnTestNotificationRequested(object? sender, EventArgs e) => tray.ShowBalloonTip(8_000, "低电提醒测试",
         $"这是一条测试通知。鼠标电量低于 {lowBatteryThreshold}% 时会提醒。", ToolTipIcon.Info);
+
+    private async Task ExportDeviceInformationAsync()
+    {
+        if (exporting || exiting) return;
+        exporting = true;
+        exportItem.Enabled = false;
+        try
+        {
+            using var dialog = new SaveFileDialog
+            {
+                Title = "导出设备接口信息",
+                FileName = "Device-report.json",
+                Filter = "JSON 文件 (*.json)|*.json",
+                DefaultExt = "json",
+                AddExtension = true,
+                OverwritePrompt = true,
+                CheckPathExists = true
+            };
+            var choice = popup.Visible ? dialog.ShowDialog(popup) : dialog.ShowDialog();
+            if (choice != DialogResult.OK) return;
+            exportItem.Text = "正在导出设备信息…";
+            string json = await Task.Run(() => JsonSerializer.Serialize(DeviceDiagnostics.Collect(), new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+            }));
+            if (exiting) return;
+            await File.WriteAllTextAsync(dialog.FileName, json);
+            if (!exiting)
+                tray.ShowBalloonTip(6_000, "设备信息已导出", "已导出设备接口信息，未包含设备路径或序列号", ToolTipIcon.Info);
+        }
+        catch (Exception ex)
+        {
+            if (!exiting) tray.ShowBalloonTip(6_000, "导出设备信息失败", ex.Message, ToolTipIcon.Warning);
+        }
+        finally
+        {
+            exporting = false;
+            if (!exiting)
+            {
+                exportItem.Enabled = true;
+                exportItem.Text = "导出设备信息…";
+            }
+        }
+    }
 
     private void SetLowBatteryOptions(bool enabled, int threshold)
     {

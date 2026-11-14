@@ -7,6 +7,7 @@ identifiers and the Nordic52 / CompX battery-report format were researched using
 
 - [Fan4Metal/mouse_tray: Nordic52 device registry and protocol description](https://github.com/Fan4Metal/mouse_tray/blob/master/mouse_tray/drivers/chipset/nordic52.py)
 - [HeyOkay/HaloBattery: additional CompX / Dragonfly receiver observations](https://github.com/HeyOkay/HaloBattery/blob/main/providers/pulsar.py)
+- [VGN official Web HUB](https://drive.vgnlab.com.cn/): F2 Master GT device identifiers and its 17-byte battery report format (registry/control logic observed in `assets/index-BfN6tzNB.js`). Official JavaScript is not redistributed.
 
 These projects' source files and executables are not included in this repository
 or the release ZIP. Their own licenses remain applicable to their code. The MIT

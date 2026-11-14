@@ -42,6 +42,7 @@
 | 型号或系列 | 已登记连接方式 | 本项目实机验证 |
 | --- | --- | --- |
 | VGN F2 Pro Max | 2.4G 接收器、USB 有线 | 接收器已验证，读到 100%；有线待验证 |
+| VGN F2 大师版 GT / Master GT | `391D:102D` 接收器、`391D:1032` 有线（v1.0.1 起） | 按官方驱动协议适配，实机待验证 |
 | VGN F1 Pro | 2.4G 接收器、USB 有线 | 待验证 |
 | VGN Dragonfly 4K 接收器 / 系列有线接口 | USB 接收器、有线 | 待验证；共享接收器不能确定唯一鼠标型号 |
 | VXE R1 Pro / R1 Pro Max | 2.4G 接收器、USB 有线 | 待验证；部分 USB 标识共用 |
@@ -55,6 +56,8 @@
 
 协议参考：[Nordic52 型号与电量查询](https://github.com/Fan4Metal/mouse_tray/blob/master/mouse_tray/drivers/chipset/nordic52.py)、[Dragonfly 4K 接口登记](https://github.com/HeyOkay/HaloBattery/blob/main/providers/pulsar.py)。本项目是独立开发的工具，未打包厂商驱动或第三方鼠标软件。
 
+F2 Master GT 的设备编号与 17 字节电量协议依据 [VGN 官方网页驱动](https://drive.vgnlab.com.cn/) 的设备表和电量控制器。v1.0.0 只扫描 `3554` / `373B`，会漏掉该型号的 `391D` 厂商编号；使用该型号请升级到 v1.0.1 或更新版本。
+
 ## 常见问题
 
 **鼠标还能用，图标为什么变灰？**
@@ -64,6 +67,8 @@
 **只显示接收器名称，或者提示暂不支持？**
 
 部分接收器只报告通用名称，且可以配对不同鼠标，无法据此精确推断型号。未登记的硬件或新协议需要另行适配。反馈问题时请提供型号、连接方式和 USB VID/PID；不要把“自动识别”理解为兼容全部 VGN 产品。
+
+v1.0.1 起可右键托盘选择“导出设备信息”，生成仅含设备描述、VID/PID、接口用途与报告长度的 JSON，不含设备路径或序列号。该导出不发送电量或配置查询，可用于排查尚未支持的设备。
 
 **蓝牙能看到电量，插着 USB 接收器却读不到？**
 
@@ -106,6 +111,7 @@
 ```powershell
 .\VgnBattery.exe --self-test   # 运行离线检查，结果写到程序旁 self-test.txt
 .\VgnBattery.exe --enumerate   # 将匹配厂商的 HID 接口写到程序旁 devices.json
+.\VgnBattery.exe --diagnose    # 枚举全部 HID，导出不含设备路径的 device-report.json
 .\VgnBattery.exe --query       # 查询一次，结果写到本地数据目录的 status.json
 .\VgnBattery.exe --show        # 运行并展开详情窗口
 .\VgnBattery.exe --self-test --output-dir .\diagnostics  # 指定诊断结果目录
@@ -117,7 +123,7 @@
 
 2026-11-15，已在 Windows 11 x64、VGN F2 Pro Max 的 2.4G 接收器上读取到真实的 **100%** 电量，并连续收到间隔约 5 秒、校验正确的回复。已检查 150% 系统缩放下的型号、百分比、设置卡片和阈值控件，并验证从电池区域拖动窗口。
 
-另有 **43 项离线检查**覆盖协议解析、设备识别、托盘图标、拖动区域、设置边界、启动项迁移和低电通知策略。离线检查通过不代表其它型号或 USB 有线连接已经实机验证。电量百分比由鼠标固件提供，可能受其量化、更新频率和休眠行为影响。
+另有 **50 项离线检查**覆盖协议解析、设备识别、托盘图标、拖动区域、设置边界、启动项迁移、设备报告脱敏和低电通知策略。离线检查通过不代表 GT、其它型号或 USB 有线连接已经实机验证。电量百分比由鼠标固件提供，可能受其量化、更新频率和休眠行为影响。
 
 ## 许可证
 
