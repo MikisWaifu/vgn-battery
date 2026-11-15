@@ -123,6 +123,14 @@ internal static class Program
             frame[16] = unchecked((byte)(0x55-frame.Sum(b=>(int)b)));
             return frame;
         }
+        byte[] KeychronFrame(byte level, bool charging)
+        {
+            var frame = new byte[64];
+            frame[0] = 0xb4;
+            frame[1] = 0x06;
+            frame[20] = (byte)(level | (charging ? 0x80 : 0));
+            return frame;
+        }
         void Check(bool success, string label) { if (!success) throw new InvalidDataException(label); }
         Check(BatteryReader.Parse(Frame(67,false),0xfb3e).Percent==67,"wireless percent");
         Check(BatteryReader.Parse(Frame(0,false,3300),0xfb3e).Percent==0,"real zero percent");
@@ -197,12 +205,29 @@ internal static class Program
         Check(DeviceCatalog.Find(0x391d,0x1032) is { Wired:true },"F2 Master GT cable registered");
         Check(DeviceCatalog.Model(actualName with { VendorId=0x391d,ProductId=0x102d,Product="Compx" },DeviceCatalog.Find(0x391d,0x102d))=="VGN F2 Master GT","GT generic receiver model fallback");
         Check(DeviceCatalog.Find(0x391d,0xffff) is null,"unknown device from GT vendor not queried");
+        Check(BatteryReader.ParseKeychron(KeychronFrame(67,false)).Percent==67,"keychron wireless percent");
+        Check(BatteryReader.ParseKeychron(KeychronFrame(0,false)).Percent==0,"keychron real zero percent");
+        Check(BatteryReader.ParseKeychron(KeychronFrame(38,true),true).Charging,"keychron charging flag");
+        Check(!BatteryReader.ParseKeychron(KeychronFrame(100,true),true).Charging,"keychron full is not charging");
+        Check(BatteryReader.ParseKeychron(KeychronFrame(101,false)).Percent is null,"keychron out of range rejected");
+        var wrongReportId=KeychronFrame(50,false); wrongReportId[0]=0xb5;
+        Check(BatteryReader.ParseKeychron(wrongReportId).Percent is null,"keychron wrong report id rejected");
+        Check(BatteryReader.ParseKeychron(new byte[20]).Percent is null,"keychron short report rejected");
+        Check(DeviceCatalog.Find(0x3434,0xd028) is { Wired:false, QueryModel:true },"keychron receiver registered");
+        Check(DeviceCatalog.Find(0x3434,0xd048) is { Wired:true },"keychron wired M5 registered");
+        Check(DeviceCatalog.Find(0x3434,0xd049) is { Wired:true },"keychron wired M6 registered");
+        Check(DeviceCatalog.Find(0x3434,0xffff) is null,"unknown keychron device never queried");
+        Check(DeviceCatalog.IsVendor(0x3434) && !DeviceCatalog.IsVendor(0x1234),"scan accepts registered vendors only");
+        var receiverProfile=DeviceCatalog.Find(0x3434,0xd028)!;
+        Check(receiverProfile.Matches(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xffc1,1,64,64,0)),"keychron receiver matches its 64-byte collection");
+        Check(!receiverProfile.Matches(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xff60,0x61,33,33,0)),"keychron receiver never targets the raw HID collection");
+        Check(DeviceCatalog.Model(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xffc1,1,64,64,0),receiverProfile)=="Keychron Ultra-Link 8K","keychron product name preserved");
         var failedResponse=Frame(55,false); failedResponse[2]=1; failedResponse[16]=0; failedResponse[16]=unchecked((byte)(0x55-failedResponse.Sum(b=>(int)b)));
         Check(BatteryReader.Parse(failedResponse,0xfb3e).Percent is null,"error response with valid checksum rejected");
         string shareReport=JsonSerializer.Serialize(DeviceDiagnostics.CreateReport([actualName with { Path="private-device-path-and-serial",VendorId=0x391d,ProductId=0x102d }],[]));
         Check(!shareReport.Contains("private-device-path-and-serial",StringComparison.Ordinal),"share report omits device path and serial");
         Check(shareReport.Contains("391D",StringComparison.Ordinal) && shareReport.Contains("102D",StringComparison.Ordinal),"share report retains model identifiers");
-        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 50 protocol, identity, icon, dragging, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
+        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 65 protocol, identity, icon, dragging, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
     }
 
     private static void RenderIconPreview()

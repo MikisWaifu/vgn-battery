@@ -76,7 +76,7 @@ internal static class NativeHid
                     string path = Marshal.PtrToStringUni(detail + 4) ?? "";
                     ushort? pathVendor = ParsePathIdentifier(path, "vid_");
                     ushort? pathProduct = ParsePathIdentifier(path, "pid_");
-                    if (!includeAll && pathVendor is not (0x3554 or 0x373b or 0x391d)) continue;
+                    if (!includeAll && (pathVendor is not ushort vendor || !DeviceCatalog.IsVendor(vendor))) continue;
                     using var handle = Open(path);
                     if (handle.IsInvalid)
                     {
