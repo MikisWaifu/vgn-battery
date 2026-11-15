@@ -222,12 +222,15 @@ internal static class Program
         Check(receiverProfile.Matches(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xffc1,1,64,64,0)),"keychron receiver matches its 64-byte collection");
         Check(!receiverProfile.Matches(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xff60,0x61,33,33,0)),"keychron receiver never targets the raw HID collection");
         Check(DeviceCatalog.Model(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xffc1,1,64,64,0),receiverProfile)=="Keychron Ultra-Link 8K","keychron product name preserved");
+        Check(TrayApp.NormalizePollSeconds(null)==45,"poll interval defaults to 45 seconds");
+        Check(TrayApp.NormalizePollSeconds(5)==5,"poll interval accepts five seconds");
+        Check(TrayApp.NormalizePollSeconds(600)==45,"poll interval rejects out of range values");
         var failedResponse=Frame(55,false); failedResponse[2]=1; failedResponse[16]=0; failedResponse[16]=unchecked((byte)(0x55-failedResponse.Sum(b=>(int)b)));
         Check(BatteryReader.Parse(failedResponse,0xfb3e).Percent is null,"error response with valid checksum rejected");
         string shareReport=JsonSerializer.Serialize(DeviceDiagnostics.CreateReport([actualName with { Path="private-device-path-and-serial",VendorId=0x391d,ProductId=0x102d }],[]));
         Check(!shareReport.Contains("private-device-path-and-serial",StringComparison.Ordinal),"share report omits device path and serial");
         Check(shareReport.Contains("391D",StringComparison.Ordinal) && shareReport.Contains("102D",StringComparison.Ordinal),"share report retains model identifiers");
-        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 65 protocol, identity, icon, dragging, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
+        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 68 protocol, identity, icon, dragging, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
     }
 
     private static void RenderIconPreview()
@@ -265,6 +268,9 @@ internal static class Program
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("显示电量数字"){CheckOnClick=true,Checked=true});
         menu.Items.Add(new ToolStripMenuItem("低电通知（低于 20%）"){CheckOnClick=true,Checked=true});
+        var interval = new ToolStripMenuItem("刷新间隔");
+        foreach (int seconds in new[]{5,15,45,120}) interval.DropDownItems.Add(new ToolStripMenuItem($"每 {seconds} 秒"){Checked=seconds==45});
+        menu.Items.Add(interval);
         menu.Items.Add(new ToolStripMenuItem("开机自动运行"){CheckOnClick=true,Checked=false});
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出");

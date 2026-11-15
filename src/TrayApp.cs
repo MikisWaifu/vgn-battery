@@ -8,6 +8,8 @@ namespace VgnBattery;
 internal sealed class TrayApp : ApplicationContext
 {
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    internal const int DefaultPollSeconds = 45;
+    private static readonly int[] PollChoices = [5, 15, 45, 120];
     private static readonly string SettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VgnBattery", "settings.json");
     private readonly BatteryReader reader = new();
     private readonly NotifyIcon tray;
@@ -18,6 +20,7 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem percentageItem;
     private readonly ToolStripMenuItem lowBatteryItem;
     private readonly ToolStripMenuItem exportItem;
+    private readonly ToolStripMenuItem pollIntervalItem;
     private readonly LowBatteryPolicy lowBatteryPolicy = new();
     private Icon? currentIcon;
     private (int? Percent, bool Charging, bool Digits, bool Light, bool Stale, int Size)? renderedIcon;
@@ -28,6 +31,7 @@ internal sealed class TrayApp : ApplicationContext
     private bool showPercentage = true;
     private bool lowBatteryEnabled = true;
     private int lowBatteryThreshold = 20;
+    private int pollSeconds = DefaultPollSeconds;
 
     public TrayApp()
     {
@@ -46,6 +50,8 @@ internal sealed class TrayApp : ApplicationContext
                 lowBatteryEnabled = enabled.GetBoolean();
             if (document.RootElement.TryGetProperty("LowBatteryThreshold", out var threshold) && threshold.TryGetInt32(out int valueThreshold))
                 lowBatteryThreshold = Math.Clamp(valueThreshold, 1, 99);
+            if (document.RootElement.TryGetProperty("PollSeconds", out var poll) && poll.TryGetInt32(out int pollValue))
+                pollSeconds = NormalizePollSeconds(pollValue);
         }
         catch { /* A missing or damaged preference file uses a battery with digits. */ }
 
@@ -72,6 +78,14 @@ internal sealed class TrayApp : ApplicationContext
         lowBatteryItem = new ToolStripMenuItem($"低电通知（低于 {lowBatteryThreshold}%）") { CheckOnClick = true, Checked = lowBatteryEnabled };
         lowBatteryItem.CheckedChanged += (_, _) => SetLowBatteryOptions(lowBatteryItem.Checked, lowBatteryThreshold);
         menu.Items.Add(lowBatteryItem);
+        pollIntervalItem = new ToolStripMenuItem("刷新间隔");
+        foreach (int seconds in PollChoices)
+        {
+            var choice = new ToolStripMenuItem($"每 {seconds} 秒") { Tag = seconds };
+            choice.Click += (_, _) => SetPollSeconds(seconds);
+            pollIntervalItem.DropDownItems.Add(choice);
+        }
+        menu.Items.Add(pollIntervalItem);
         startupItem = new ToolStripMenuItem("开机自动运行") { CheckOnClick = true };
         startupItem.Click += (_, _) => SetStartup(startupItem.Checked);
         menu.Items.Add(startupItem);
@@ -88,7 +102,7 @@ internal sealed class TrayApp : ApplicationContext
         tray.Visible = true;
         if (migrateSettings) SaveSettings();
         timer = new System.Windows.Forms.Timer { Interval = 100 };
-        timer.Tick += async (_, _) => { timer.Interval = 5_000; await RefreshAsync(); };
+        timer.Tick += async (_, _) => { timer.Interval = pollSeconds * 1000; await RefreshAsync(); };
         timer.Start();
         SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
@@ -242,6 +256,22 @@ internal sealed class TrayApp : ApplicationContext
         UpdateDisplay();
     }
 
+    private void SetPollSeconds(int seconds)
+    {
+        seconds = NormalizePollSeconds(seconds);
+        if (pollSeconds == seconds)
+        {
+            SyncPopupSettings();
+            return;
+        }
+        pollSeconds = seconds;
+        SaveSettings();
+        timer.Interval = pollSeconds * 1000;
+        UpdateDisplay();
+    }
+
+    internal static int NormalizePollSeconds(int? seconds) => seconds is >= 5 and <= 120 ? seconds.Value : DefaultPollSeconds;
+
     private void SyncPopupSettings(bool forcePopup = false)
     {
         bool startup = IsStartupEnabled();
@@ -249,6 +279,8 @@ internal sealed class TrayApp : ApplicationContext
         if (percentageItem.Checked != showPercentage) percentageItem.Checked = showPercentage;
         if (lowBatteryItem.Checked != lowBatteryEnabled) lowBatteryItem.Checked = lowBatteryEnabled;
         lowBatteryItem.Text = $"低电通知（低于 {lowBatteryThreshold}%）";
+        foreach (ToolStripMenuItem choice in pollIntervalItem.DropDownItems) choice.Checked = (int)choice.Tag! == pollSeconds;
+        popup.PollSeconds = pollSeconds;
         if (forcePopup || popup.Visible)
             popup.SetState(current, refreshing, startup, showPercentage, lowBatteryEnabled, lowBatteryThreshold);
     }
@@ -316,7 +348,8 @@ internal sealed class TrayApp : ApplicationContext
             string temporary = SettingsPath + ".tmp";
             File.WriteAllText(temporary, JsonSerializer.Serialize(new AppSettings
             {
-                ShowPercentage = showPercentage, LowBatteryEnabled = lowBatteryEnabled, LowBatteryThreshold = lowBatteryThreshold
+                ShowPercentage = showPercentage, LowBatteryEnabled = lowBatteryEnabled, LowBatteryThreshold = lowBatteryThreshold,
+                PollSeconds = pollSeconds
             }));
             File.Move(temporary, SettingsPath, true);
         }
@@ -371,6 +404,7 @@ internal sealed class TrayApp : ApplicationContext
         public bool ShowPercentage { get; set; } = true;
         public bool LowBatteryEnabled { get; set; } = true;
         public int LowBatteryThreshold { get; set; } = 20;
+        public int PollSeconds { get; set; } = DefaultPollSeconds;
     }
     internal sealed record BatteryView(int? Percent, bool Charging, string Message, DateTimeOffset Timestamp, string Transport, string Model = "鼠标电量", bool Stale = false);
 }
@@ -385,6 +419,7 @@ internal sealed class BatteryPopup : Form
     private readonly Label chargeState;
     private readonly Label message;
     private readonly Label updated;
+    private readonly Label hint;
     private readonly CheckBox startup;
     private readonly CheckBox showPercentage;
     private readonly CheckBox lowBattery;
@@ -400,6 +435,9 @@ internal sealed class BatteryPopup : Form
     public bool PercentageChecked => showPercentage.Checked;
     public bool LowBatteryChecked => lowBattery.Checked;
     public int NotificationThreshold => (int)notificationThreshold.Value;
+
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    internal int PollSeconds { get; set; } = TrayApp.DefaultPollSeconds;
 
     public BatteryPopup()
     {
@@ -563,7 +601,7 @@ internal sealed class BatteryPopup : Form
         settings.Controls.Add(lowBatteryRow, 0, 4);
         settingsCard.Controls.Add(settings);
         layout.Controls.Add(settingsCard, 0, 5);
-        var hint = MakeLabel("自动更新 · 每5秒", 8F);
+        hint = MakeLabel("自动更新 · 每 45 秒", 8F);
         hint.ForeColor = Color.FromArgb(113, 125, 143);
         hint.TextAlign = ContentAlignment.MiddleLeft;
         layout.Controls.Add(hint, 0, 6);
@@ -611,6 +649,7 @@ internal sealed class BatteryPopup : Form
             : view.Percent is int remaining && lowBatteryEnabled && remaining < lowBatteryThreshold && !view.Charging ? "电量较低，建议充电"
             : TrayApp.ChargeLabel(view);
         message.Text = view.Stale ? "移动鼠标后会自动更新，当前显示最近一次读数。" : view.Message;
+        hint.Text = $"自动更新 · 每 {PollSeconds} 秒";
         updated.Text = (view.Stale ? "上次读数 · " : view.Percent is null ? "最近尝试 · " : "已更新 · ") + view.Timestamp.LocalDateTime.ToString("HH:mm:ss");
         battery.Percent = view.Percent;
         battery.Charging = !view.Stale && view.Charging;
