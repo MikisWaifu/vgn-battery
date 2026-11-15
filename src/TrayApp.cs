@@ -79,6 +79,13 @@ internal sealed class TrayApp : ApplicationContext
         lowBatteryItem.CheckedChanged += (_, _) => SetLowBatteryOptions(lowBatteryItem.Checked, lowBatteryThreshold);
         menu.Items.Add(lowBatteryItem);
         pollIntervalItem = new ToolStripMenuItem("刷新间隔");
+        // The choices are a radio group, so they are never CheckOnClick items: the
+        // submenu has to reserve the check margin on its own.
+        if (pollIntervalItem.DropDown is ToolStripDropDownMenu choicesMenu)
+        {
+            choicesMenu.ShowImageMargin = false;
+            choicesMenu.ShowCheckMargin = true;
+        }
         foreach (int seconds in PollChoices)
         {
             var choice = new ToolStripMenuItem($"每 {seconds} 秒") { Tag = seconds };

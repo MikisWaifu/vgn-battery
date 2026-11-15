@@ -46,7 +46,8 @@ internal sealed class DarkMenuRenderer : ToolStripProfessionalRenderer
             e.Graphics.FillRectangle(brush, highlight);
         }
 
-        if (e.Item is ToolStripMenuItem { CheckOnClick: true } item)
+        // Toggles always show their box; a radio choice only shows it when selected.
+        if (e.Item is ToolStripMenuItem item && (item.CheckOnClick || item.Checked))
             DrawCheckBox(e.Graphics, CheckBounds(e.ToolStrip, item), item.Checked, item.Enabled, e.ToolStrip);
     }
 

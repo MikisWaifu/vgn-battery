@@ -280,5 +280,20 @@ internal static class Program
         using var bitmap=new Bitmap(menu.Width,menu.Height);
         menu.DrawToBitmap(bitmap,new Rectangle(Point.Empty,menu.Size));
         bitmap.Save(DiagnosticPath("menu-preview.png"),System.Drawing.Imaging.ImageFormat.Png);
+
+        if (interval.DropDown is ToolStripDropDownMenu choices)
+        {
+            choices.ShowImageMargin=false;
+            choices.ShowCheckMargin=true;
+            choices.Font=new Font("Microsoft YaHei UI",9.5F);
+            choices.BackColor=Color.FromArgb(27,30,36);
+            choices.ForeColor=Color.FromArgb(239,243,250);
+            choices.Padding=new Padding(4);
+            choices.PerformLayout();
+            choices.Size=choices.GetPreferredSize(Size.Empty);
+            using var sheet=new Bitmap(choices.Width,choices.Height);
+            choices.DrawToBitmap(sheet,new Rectangle(Point.Empty,choices.Size));
+            sheet.Save(DiagnosticPath("menu-interval-preview.png"),System.Drawing.Imaging.ImageFormat.Png);
+        }
     }
 }
