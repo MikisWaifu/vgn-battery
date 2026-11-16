@@ -6,7 +6,9 @@ $releaseVersion = [string]$projectMetadata.Project.PropertyGroup.Version
 $targetFramework = [string]$projectMetadata.Project.PropertyGroup.TargetFramework
 $publishDirectory = Join-Path $PSScriptRoot "artifacts/releases/VgnBattery-$releaseVersion-win-x64"
 $releaseDirectory = Join-Path $PSScriptRoot 'releases'
-dotnet publish ./src/VgnBattery.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -p:DebugType=None -p:DebugSymbols=false -o $publishDirectory --nologo
+# The ZIP already compresses the download. Leaving the embedded assemblies
+# uncompressed avoids retaining their decompressed copies in process memory.
+dotnet publish ./src/VgnBattery.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $publishDirectory --nologo
 if ($LASTEXITCODE -ne 0) { throw '发行版生成失败' }
 $releaseExecutable = Join-Path $publishDirectory 'VgnBattery.exe'
 $testDirectory = Join-Path $publishDirectory 'checks'

@@ -128,11 +128,22 @@ internal static class Program
             qaTimer.Start();
         }
 #endif
-        using var showTimer = new System.Windows.Forms.Timer { Interval=300 };
-        showTimer.Tick += (_,_) => { if (showEvent.WaitOne(0)) context.ShowPopup(); };
-        showTimer.Start();
-        if (args.Contains("--show")) showEvent.Set();
-        Application.Run(context);
+        // A second instance signals this event. Wait for it instead of waking
+        // the UI thread every 300ms while the tray is idle.
+        var showWait = ThreadPool.RegisterWaitForSingleObject(showEvent,
+            (_,_) => context.ShowPopup(), null, Timeout.Infinite, executeOnlyOnce:false);
+        try
+        {
+            if (args.Contains("--show")) showEvent.Set();
+            Application.Run(context);
+        }
+        finally
+        {
+            // ShowPopup safely posts to the UI thread, including during exit.
+            // Drain callbacks before disposing the context and event handles.
+            using var callbacksStopped = new ManualResetEvent(false);
+            if (showWait.Unregister(callbacksStopped)) callbacksStopped.WaitOne();
+        }
         mutex.ReleaseMutex();
 #endif
     }

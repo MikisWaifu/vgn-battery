@@ -37,11 +37,13 @@ internal sealed class TrayApp : ApplicationContext
     private readonly ToolStripMenuItem rotationItem;
     private bool refreshing;
     private bool refreshQueued;
-    private bool exiting;
+    private volatile bool exiting;
 #if !UI_QA
     private bool exporting;
 #endif
     private bool showPercentage = true;
+    private bool lightTaskbar;
+    private bool startupEnabled;
     private bool lowBatteryEnabled = true;
     private int lowBatteryThreshold = 20;
     private int pollSeconds = DefaultPollSeconds;
@@ -81,6 +83,7 @@ internal sealed class TrayApp : ApplicationContext
         catch { /* Missing preferences retain safe defaults: fixed display and 30-second polling. */ }
 
         MigrateExistingStartupRegistration();
+        lightTaskbar = UsesLightTaskbar();
         popup = new BatteryPopup();
         popup.StartupRequested += (_, _) => SetStartup(popup.StartupChecked);
         popup.PercentageRequested += (_, _) => SetShowPercentage(popup.PercentageChecked);
@@ -128,7 +131,7 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add(exportItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("退出", null, (_, _) => ExitThread());
-        menu.Opening += (_, _) => SyncPopupSettings();
+        menu.Opening += (_, _) => SyncPopupSettings(forceMenu: true, readStartup: true);
 
         timer = new System.Windows.Forms.Timer { Interval = 100 };
         timer.Tick += async (_, _) => { timer.Interval = pollSeconds * 1000; await RefreshAsync(); };
@@ -182,14 +185,21 @@ internal sealed class TrayApp : ApplicationContext
         _ => "固定一只"
     };
 
-    public void ShowPopup() => ShowPopup(null);
+    public void ShowPopup()
+    {
+        if (exiting) return;
+        // Event-wait callbacks run off the UI thread. Always post, because a
+        // destroyed handle can make InvokeRequired return false during exit.
+        try { popup.BeginInvoke(() => ShowPopup(null)); }
+        catch (InvalidOperationException) { /* The popup may be disposed while posting. */ }
+    }
 
     private void ShowPopup(string? deviceId)
     {
         if (exiting) return;
         if (popup.InvokeRequired) { popup.BeginInvoke(() => ShowPopup(deviceId)); return; }
         detailsDeviceId = deviceId ?? display.GetVisible()[0].DeviceId;
-        SyncPopupSettings(forcePopup:true);
+        SyncPopupSettings(forcePopup: true, readStartup: true);
         popup.PositionNearTray();
         popup.TopMost = true;
         popup.Show();
@@ -225,7 +235,7 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (refreshing || exiting) return;
         refreshing = true;
-        UpdateDisplay();
+        SyncPopupSettings();
         try
         {
 #if UI_QA
@@ -244,7 +254,6 @@ internal sealed class TrayApp : ApplicationContext
             if (oldFixedId != display.FixedDeviceId) SaveSettings();
             if (string.IsNullOrEmpty(detailsDeviceId))
                 detailsDeviceId = display.GetVisible().FirstOrDefault(d => !string.IsNullOrEmpty(d.DeviceId))?.DeviceId;
-            UpdateDisplay();
             var warnings = new List<MouseBattery>();
             foreach (var device in snapshot)
             {
@@ -288,7 +297,6 @@ internal sealed class TrayApp : ApplicationContext
                 icons[wanted[0].DeviceId] = existing.Value;
             }
         }
-        bool light = UsesLightTaskbar();
         int size = Math.Max(16, (int)Math.Round(16 * popup.DeviceDpi / 96d));
         foreach (var device in wanted)
         {
@@ -299,7 +307,7 @@ internal sealed class TrayApp : ApplicationContext
                 host.ContextRequested += (sender, _) => { if (sender is TrayIconHost clicked) contextDeviceId = clicked.DeviceId; };
                 icons.Add(device.DeviceId, host);
             }
-            host.Update(device, showPercentage, light, size);
+            host.Update(device, showPercentage, lightTaskbar, size);
         }
         var wantedIds = wanted.Select(d => d.DeviceId).ToHashSet(StringComparer.Ordinal);
         foreach (string removed in icons.Keys.Where(id => !wantedIds.Contains(id)).ToArray())
@@ -307,8 +315,6 @@ internal sealed class TrayApp : ApplicationContext
             icons[removed].Dispose();
             icons.Remove(removed);
         }
-        refreshItem.Enabled = !refreshing;
-        refreshItem.Text = refreshing ? "正在刷新…" : "立即刷新";
         ConfigureRotation();
         SyncPopupSettings();
 #if UI_QA
@@ -354,6 +360,7 @@ internal sealed class TrayApp : ApplicationContext
             SetPollSeconds(120);
             SetRotateSeconds(3);
             Check(timer.Interval == 120000 && rotationTimer.Interval == 3000, "query and rotation intervals are independent");
+            SyncPopupSettings(forceMenu: true);
             Check(pollIntervalItem.DropDownItems.OfType<ToolStripMenuItem>().Single(i => i.Checked).Tag is 120, "query menu marks the selected interval");
             SetDisplayMode(MouseDisplayMode.Fixed);
             Check(!rotationTimer.Enabled && icons.Keys.Single() == "qa-b", "fixed mode stops rotation and restores its target");
@@ -382,7 +389,7 @@ internal sealed class TrayApp : ApplicationContext
             File.WriteAllText(Path.Combine(directory, "state.json"), JsonSerializer.Serialize(new
             {
                 Mode = display.Mode.ToString(), FixedDeviceId = display.FixedDeviceId,
-                DetailsDeviceId = detailsDeviceId, VisibleHostCount = icons.Count,
+                DetailsDeviceId = detailsDeviceId, PopupVisible = popup.Visible, VisibleHostCount = icons.Count,
                 HostIds = icons.Keys.ToArray(), VisibleDeviceIds = display.GetVisible().Select(d => d.DeviceId).ToArray()
             }, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -527,48 +534,58 @@ internal sealed class TrayApp : ApplicationContext
         return choices;
     }
 
-    private void SyncPopupSettings(bool forcePopup = false)
+    private void SyncPopupSettings(bool forcePopup = false, bool forceMenu = false, bool readStartup = false)
     {
-        bool startup = IsStartupEnabled();
-        startupItem.Checked = startup;
-        if (percentageItem.Checked != showPercentage) percentageItem.Checked = showPercentage;
-        if (lowBatteryItem.Checked != lowBatteryEnabled) lowBatteryItem.Checked = lowBatteryEnabled;
-        lowBatteryItem.Text = $"低电通知（低于 {lowBatteryThreshold}%）";
-        foreach (ToolStripMenuItem choice in pollIntervalItem.DropDownItems) choice.Checked = (int)choice.Tag! == pollSeconds;
-        foreach (ToolStripMenuItem choice in rotationItem.DropDownItems) choice.Checked = (int)choice.Tag! == rotateSeconds;
-        foreach (ToolStripMenuItem choice in modeItem.DropDownItems) choice.Checked = (MouseDisplayMode)choice.Tag! == display.Mode;
-        fixedTargetItem.Enabled = display.Mode == MouseDisplayMode.Fixed;
-        rotationItem.Enabled = display.Mode == MouseDisplayMode.Rotate;
+        bool syncPopup = forcePopup || popup.Visible;
+        bool syncMenu = forceMenu || menu.Visible;
+        // Hidden controls are refreshed when opened; polling and rotation only
+        // need to keep the shell icons and model up to date in the background.
+        if (!syncPopup && !syncMenu) return;
+        if (readStartup) startupEnabled = IsStartupEnabled();
         var choices = DeviceChoices();
-        string signature = string.Join("\n", choices.Select(c => c.Value + "|" + c.Text + "|" + c.Enabled));
-        if (signature != targetsSignature)
+        if (syncMenu)
         {
-            foreach (ToolStripItem old in fixedTargetItem.DropDownItems.Cast<ToolStripItem>().ToArray()) old.Dispose();
-            fixedTargetItem.DropDownItems.Clear();
-            foreach (var device in choices)
+            refreshItem.Enabled = !refreshing;
+            refreshItem.Text = refreshing ? "正在刷新…" : "立即刷新";
+            startupItem.Checked = startupEnabled;
+            if (percentageItem.Checked != showPercentage) percentageItem.Checked = showPercentage;
+            if (lowBatteryItem.Checked != lowBatteryEnabled) lowBatteryItem.Checked = lowBatteryEnabled;
+            lowBatteryItem.Text = $"低电通知（低于 {lowBatteryThreshold}%）";
+            foreach (ToolStripMenuItem choice in pollIntervalItem.DropDownItems) choice.Checked = (int)choice.Tag! == pollSeconds;
+            foreach (ToolStripMenuItem choice in rotationItem.DropDownItems) choice.Checked = (int)choice.Tag! == rotateSeconds;
+            foreach (ToolStripMenuItem choice in modeItem.DropDownItems) choice.Checked = (MouseDisplayMode)choice.Tag! == display.Mode;
+            fixedTargetItem.Enabled = display.Mode == MouseDisplayMode.Fixed;
+            rotationItem.Enabled = display.Mode == MouseDisplayMode.Rotate;
+            string signature = string.Join("\n", choices.Select(c => c.Value + "|" + c.Text + "|" + c.Enabled));
+            if (signature != targetsSignature)
             {
-                var item = new ToolStripMenuItem(device.Text) { Tag = device.Value, Enabled = device.Enabled };
-                item.Click += (_, _) => SetFixedTarget(device.Value);
-                fixedTargetItem.DropDownItems.Add(item);
+                foreach (ToolStripItem old in fixedTargetItem.DropDownItems.Cast<ToolStripItem>().ToArray()) old.Dispose();
+                fixedTargetItem.DropDownItems.Clear();
+                foreach (var device in choices)
+                {
+                    var item = new ToolStripMenuItem(device.Text) { Tag = device.Value, Enabled = device.Enabled };
+                    item.Click += (_, _) => SetFixedTarget(device.Value);
+                    fixedTargetItem.DropDownItems.Add(item);
+                }
+                targetsSignature = signature;
             }
-            targetsSignature = signature;
+            foreach (ToolStripMenuItem choice in fixedTargetItem.DropDownItems) choice.Checked = (string)choice.Tag! == display.FixedDeviceId;
         }
-        foreach (ToolStripMenuItem choice in fixedTargetItem.DropDownItems) choice.Checked = (string)choice.Tag! == display.FixedDeviceId;
-        popup.PollSeconds = pollSeconds;
-        popup.SetDisplayOptions(display.Mode, display.FixedDeviceId, choices, pollSeconds, rotateSeconds);
-        if (forcePopup || popup.Visible)
+        if (syncPopup)
         {
+            popup.PollSeconds = pollSeconds;
+            popup.SetDisplayOptions(display.Mode, display.FixedDeviceId, choices, pollSeconds, rotateSeconds);
             var details = display.GetDetails(detailsDeviceId);
             var reading = details.Reading;
             popup.SetState(new(reading.Percent, reading.Charging, reading.Message, reading.Timestamp, reading.Transport, reading.Model, details.Stale),
-                refreshing, startup, showPercentage, lowBatteryEnabled, lowBatteryThreshold);
+                refreshing, startupEnabled, showPercentage, lowBatteryEnabled, lowBatteryThreshold);
         }
     }
 
     private void SetStartup(bool enabled)
     {
 #if UI_QA
-        SyncPopupSettings();
+        SyncPopupSettings(readStartup: true);
 #else
         try
         {
@@ -577,7 +594,7 @@ internal sealed class TrayApp : ApplicationContext
             else key.DeleteValue("VgnBattery", false);
         }
         catch (Exception ex) { Notify("未能更改开机启动", ex.Message, ToolTipIcon.Warning); }
-        SyncPopupSettings();
+        SyncPopupSettings(readStartup: true);
 #endif
     }
 
@@ -643,7 +660,7 @@ internal sealed class TrayApp : ApplicationContext
     private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
         if (!exiting && popup.IsHandleCreated && !popup.IsDisposed)
-            try { popup.BeginInvoke(UpdateDisplay); } catch (InvalidOperationException) { }
+            try { popup.BeginInvoke(() => { lightTaskbar = UsesLightTaskbar(); UpdateDisplay(); }); } catch (InvalidOperationException) { }
     }
 
     private void OnDisplaySettingsChanged(object? sender, EventArgs e)
