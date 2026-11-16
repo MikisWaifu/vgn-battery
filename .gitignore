@@ -10,6 +10,7 @@ layout.json
 diagnostic.log
 diagnostic-error.txt
 device-report.json
+devices-status.json
 self-test.txt
 icon-preview.png
 menu-preview.png

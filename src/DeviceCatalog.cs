@@ -15,7 +15,8 @@ internal sealed record DeviceProfile(ushort VendorId, ushort ProductId, string F
     internal bool Matches(HidDevice device) => Protocol switch
     {
         BatteryProtocol.Vgn17 => device.UsagePage == 0xff02 && device.Usage == 2 && device.InputLength == 17 && device.OutputLength == 17,
-        _ => device.UsagePage == 0xffc1 && device.Usage == 1 && device.InputLength == 64 && device.OutputLength == 64
+        BatteryProtocol.Keychron64 => device.UsagePage == 0xffc1 && device.Usage == 1 && device.InputLength == 64 && device.OutputLength == 64,
+        _ => false
     };
 }
 

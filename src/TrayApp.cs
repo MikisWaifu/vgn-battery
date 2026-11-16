@@ -8,30 +8,47 @@ namespace VgnBattery;
 internal sealed class TrayApp : ApplicationContext
 {
     private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-    internal const int DefaultPollSeconds = 45;
-    private static readonly int[] PollChoices = [5, 15, 45, 120];
+    internal const int DefaultPollSeconds = 30;
+    internal const int DefaultRotateSeconds = 5;
+    internal static readonly int[] PollChoices = [5, 15, 30, 45, 60, 120];
+    internal static readonly int[] RotateChoices = [3, 5, 10, 15];
+#if UI_QA
+    private static readonly string SettingsPath = Path.Combine(AppContext.BaseDirectory, "qa-data", "settings.json");
+#else
     private static readonly string SettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VgnBattery", "settings.json");
+#endif
     private readonly BatteryReader reader = new();
-    private readonly NotifyIcon tray;
+    private readonly MouseDisplayState display = new();
+    private readonly Dictionary<string, TrayIconHost> icons = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, LowBatteryPolicy> lowPolicies = new(StringComparer.Ordinal);
     private readonly BatteryPopup popup;
+    private readonly ContextMenuStrip menu;
     private readonly System.Windows.Forms.Timer timer;
+    private readonly System.Windows.Forms.Timer rotationTimer;
+    private readonly System.Windows.Forms.Timer deviceDebounce;
     private readonly ToolStripMenuItem refreshItem;
     private readonly ToolStripMenuItem startupItem;
     private readonly ToolStripMenuItem percentageItem;
     private readonly ToolStripMenuItem lowBatteryItem;
     private readonly ToolStripMenuItem exportItem;
     private readonly ToolStripMenuItem pollIntervalItem;
-    private readonly LowBatteryPolicy lowBatteryPolicy = new();
-    private Icon? currentIcon;
-    private (int? Percent, bool Charging, bool Digits, bool Light, bool Stale, int Size)? renderedIcon;
-    private BatteryView current = new(null, false, "正在查找鼠标…", DateTimeOffset.Now, "");
+    private readonly ToolStripMenuItem modeItem;
+    private readonly ToolStripMenuItem fixedTargetItem;
+    private readonly ToolStripMenuItem rotationItem;
     private bool refreshing;
+    private bool refreshQueued;
     private bool exiting;
+#if !UI_QA
     private bool exporting;
+#endif
     private bool showPercentage = true;
     private bool lowBatteryEnabled = true;
     private int lowBatteryThreshold = 20;
     private int pollSeconds = DefaultPollSeconds;
+    private int rotateSeconds = DefaultRotateSeconds;
+    private string? detailsDeviceId;
+    private string? contextDeviceId;
+    private string targetsSignature = "";
 
     public TrayApp()
     {
@@ -39,38 +56,63 @@ internal sealed class TrayApp : ApplicationContext
         try
         {
             using var document = JsonDocument.Parse(File.ReadAllText(SettingsPath));
-            if (document.RootElement.TryGetProperty("ShowPercentage", out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            var root = document.RootElement;
+            if (root.TryGetProperty("ShowPercentage", out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 showPercentage = value.GetBoolean();
-            else if (document.RootElement.TryGetProperty("BatteryIcon", out var legacy) && legacy.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            else if (root.TryGetProperty("BatteryIcon", out var legacy) && legacy.ValueKind is JsonValueKind.True or JsonValueKind.False)
             {
                 showPercentage = !legacy.GetBoolean();
                 migrateSettings = true;
             }
-            if (document.RootElement.TryGetProperty("LowBatteryEnabled", out var enabled) && enabled.ValueKind is JsonValueKind.True or JsonValueKind.False)
+            if (root.TryGetProperty("LowBatteryEnabled", out var enabled) && enabled.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 lowBatteryEnabled = enabled.GetBoolean();
-            if (document.RootElement.TryGetProperty("LowBatteryThreshold", out var threshold) && threshold.TryGetInt32(out int valueThreshold))
+            if (root.TryGetProperty("LowBatteryThreshold", out var threshold) && threshold.TryGetInt32(out int valueThreshold))
                 lowBatteryThreshold = Math.Clamp(valueThreshold, 1, 99);
-            if (document.RootElement.TryGetProperty("PollSeconds", out var poll) && poll.TryGetInt32(out int pollValue))
+            if (root.TryGetProperty("PollSeconds", out var poll) && poll.TryGetInt32(out int pollValue))
                 pollSeconds = NormalizePollSeconds(pollValue);
+            if (root.TryGetProperty("RotateSeconds", out var rotate) && rotate.TryGetInt32(out int rotateValue))
+                rotateSeconds = NormalizeRotateSeconds(rotateValue);
+            if (root.TryGetProperty("Mode", out var mode) && mode.ValueKind == JsonValueKind.String
+                && Enum.TryParse<MouseDisplayMode>(mode.GetString(), true, out var parsedMode) && Enum.IsDefined(parsedMode))
+                display.Mode = parsedMode;
+            if (root.TryGetProperty("FixedDeviceId", out var fixedId) && fixedId.ValueKind == JsonValueKind.String)
+                display.FixedDeviceId = fixedId.GetString() ?? "";
         }
-        catch { /* A missing or damaged preference file uses a battery with digits. */ }
+        catch { /* Missing preferences retain safe defaults: fixed display and 30-second polling. */ }
 
         MigrateExistingStartupRegistration();
         popup = new BatteryPopup();
         popup.StartupRequested += (_, _) => SetStartup(popup.StartupChecked);
         popup.PercentageRequested += (_, _) => SetShowPercentage(popup.PercentageChecked);
         popup.LowBatteryOptionsRequested += (_, _) => SetLowBatteryOptions(popup.LowBatteryChecked, popup.NotificationThreshold);
+        popup.PollRequested += (_, _) => SetPollSeconds(popup.SelectedPollSeconds);
+        popup.ModeRequested += (_, _) => SetDisplayMode(popup.SelectedDisplayMode);
+        popup.FixedTargetRequested += (_, _) => SetFixedTarget(popup.SelectedFixedDeviceId);
+        popup.RotationRequested += (_, _) => SetRotateSeconds(popup.SelectedRotateSeconds);
         popup.TestNotificationRequested += OnTestNotificationRequested;
-        popup.DevicesChanged += (_, _) => reader.InvalidateDevices();
-        var menu = new ContextMenuStrip
-        {
-            ShowImageMargin = false, ShowCheckMargin = true, Renderer = new DarkMenuRenderer(),
-            Font = new Font("Microsoft YaHei UI", 9.5F), BackColor = Color.FromArgb(27, 30, 36),
-            ForeColor = Color.FromArgb(239, 243, 250), Padding = new Padding(4)
-        };
-        menu.Items.Add("查看电量", null, (_, _) => ShowPopup());
-        refreshItem = new ToolStripMenuItem("立即刷新", null, async (_, _) => await RefreshAsync());
+        popup.DevicesChanged += OnDevicesChanged;
+
+        menu = NewMenu();
+        menu.Items.Add("查看电量", null, (_, _) => ShowPopup(contextDeviceId));
+        refreshItem = new ToolStripMenuItem("立即刷新", null, (_, _) => RequestImmediateRefresh());
         menu.Items.Add(refreshItem);
+        menu.Items.Add(new ToolStripSeparator());
+        modeItem = new ToolStripMenuItem("显示方式");
+        ConfigureSubmenu(modeItem);
+        foreach (var mode in Enum.GetValues<MouseDisplayMode>())
+        {
+            var choice = new ToolStripMenuItem(ModeLabel(mode)) { Tag = mode };
+            choice.Click += (_, _) => SetDisplayMode(mode);
+            modeItem.DropDownItems.Add(choice);
+        }
+        menu.Items.Add(modeItem);
+        fixedTargetItem = new ToolStripMenuItem("固定目标");
+        ConfigureSubmenu(fixedTargetItem);
+        menu.Items.Add(fixedTargetItem);
+        rotationItem = MakeIntervalMenu("轮换间隔", RotateChoices, SetRotateSeconds);
+        menu.Items.Add(rotationItem);
+        pollIntervalItem = MakeIntervalMenu("查询间隔", PollChoices, SetPollSeconds);
+        menu.Items.Add(pollIntervalItem);
         menu.Items.Add(new ToolStripSeparator());
         percentageItem = new ToolStripMenuItem("显示电量数字") { CheckOnClick = true, Checked = showPercentage };
         percentageItem.CheckedChanged += (_, _) => SetShowPercentage(percentageItem.Checked);
@@ -78,21 +120,6 @@ internal sealed class TrayApp : ApplicationContext
         lowBatteryItem = new ToolStripMenuItem($"低电通知（低于 {lowBatteryThreshold}%）") { CheckOnClick = true, Checked = lowBatteryEnabled };
         lowBatteryItem.CheckedChanged += (_, _) => SetLowBatteryOptions(lowBatteryItem.Checked, lowBatteryThreshold);
         menu.Items.Add(lowBatteryItem);
-        pollIntervalItem = new ToolStripMenuItem("刷新间隔");
-        // The choices are a radio group, so they are never CheckOnClick items: the
-        // submenu has to reserve the check margin on its own.
-        if (pollIntervalItem.DropDown is ToolStripDropDownMenu choicesMenu)
-        {
-            choicesMenu.ShowImageMargin = false;
-            choicesMenu.ShowCheckMargin = true;
-        }
-        foreach (int seconds in PollChoices)
-        {
-            var choice = new ToolStripMenuItem($"每 {seconds} 秒") { Tag = seconds };
-            choice.Click += (_, _) => SetPollSeconds(seconds);
-            pollIntervalItem.DropDownItems.Add(choice);
-        }
-        menu.Items.Add(pollIntervalItem);
         startupItem = new ToolStripMenuItem("开机自动运行") { CheckOnClick = true };
         startupItem.Click += (_, _) => SetStartup(startupItem.Checked);
         menu.Items.Add(startupItem);
@@ -103,38 +130,95 @@ internal sealed class TrayApp : ApplicationContext
         menu.Items.Add("退出", null, (_, _) => ExitThread());
         menu.Opening += (_, _) => SyncPopupSettings();
 
-        tray = new NotifyIcon { ContextMenuStrip = menu, Text = "鼠标电量 · 正在读取", Visible = false };
-        tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) TogglePopup(); };
-        UpdateDisplay();
-        tray.Visible = true;
-        if (migrateSettings) SaveSettings();
         timer = new System.Windows.Forms.Timer { Interval = 100 };
         timer.Tick += async (_, _) => { timer.Interval = pollSeconds * 1000; await RefreshAsync(); };
+        rotationTimer = new System.Windows.Forms.Timer { Interval = rotateSeconds * 1000 };
+        rotationTimer.Tick += (_, _) => { display.RotateNext(); UpdateDisplay(); };
+        deviceDebounce = new System.Windows.Forms.Timer { Interval = 300 };
+        deviceDebounce.Tick += (_, _) => { deviceDebounce.Stop(); RequestImmediateRefresh(); };
+        UpdateDisplay();
+        if (migrateSettings) SaveSettings();
         timer.Start();
         SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
     }
 
-    public void ShowPopup()
+    private static ContextMenuStrip NewMenu() => new()
+    {
+        ShowImageMargin = false, ShowCheckMargin = true, Renderer = new DarkMenuRenderer(),
+        Font = new Font("Microsoft YaHei UI", 9.5F), BackColor = Color.FromArgb(27, 30, 36),
+        ForeColor = Color.FromArgb(239, 243, 250), Padding = new Padding(4)
+    };
+
+    private static void ConfigureSubmenu(ToolStripMenuItem parent)
+    {
+        if (parent.DropDown is not ToolStripDropDownMenu submenu) return;
+        submenu.ShowImageMargin = false;
+        submenu.ShowCheckMargin = true;
+        submenu.Renderer = new DarkMenuRenderer();
+        submenu.Font = new Font("Microsoft YaHei UI", 9.5F);
+        submenu.BackColor = Color.FromArgb(27, 30, 36);
+        submenu.ForeColor = Color.FromArgb(239, 243, 250);
+        submenu.Padding = new Padding(4);
+    }
+
+    private static ToolStripMenuItem MakeIntervalMenu(string label, IEnumerable<int> values, Action<int> selected)
+    {
+        var parent = new ToolStripMenuItem(label);
+        ConfigureSubmenu(parent);
+        foreach (int seconds in values)
+        {
+            var choice = new ToolStripMenuItem($"每 {seconds} 秒") { Tag = seconds };
+            choice.Click += (_, _) => selected(seconds);
+            parent.DropDownItems.Add(choice);
+        }
+        return parent;
+    }
+
+    internal static string ModeLabel(MouseDisplayMode mode) => mode switch
+    {
+        MouseDisplayMode.Rotate => "轮流显示",
+        MouseDisplayMode.Tiled => "全部平铺",
+        _ => "固定一只"
+    };
+
+    public void ShowPopup() => ShowPopup(null);
+
+    private void ShowPopup(string? deviceId)
     {
         if (exiting) return;
-        if (popup.InvokeRequired)
-        {
-            popup.BeginInvoke(ShowPopup);
-            return;
-        }
+        if (popup.InvokeRequired) { popup.BeginInvoke(() => ShowPopup(deviceId)); return; }
+        detailsDeviceId = deviceId ?? display.GetVisible()[0].DeviceId;
         SyncPopupSettings(forcePopup:true);
         popup.PositionNearTray();
         popup.TopMost = true;
         popup.Show();
         popup.Activate();
+        RequestImmediateRefresh();
     }
 
-    private void TogglePopup()
+    private void TogglePopup(string deviceId)
     {
         if (exiting) return;
-        if (popup.Visible) { popup.Hide(); return; }
-        ShowPopup();
+        if (popup.Visible && detailsDeviceId == deviceId) { popup.Hide(); return; }
+        ShowPopup(deviceId);
+    }
+
+    private void OnDevicesChanged(object? sender, EventArgs e)
+    {
+        if (exiting) return;
+#if !UI_QA
+        reader.InvalidateDevices();
+#endif
+        deviceDebounce.Stop();
+        deviceDebounce.Start();
+    }
+
+    private void RequestImmediateRefresh()
+    {
+        if (exiting) return;
+        if (refreshing) { refreshQueued = true; return; }
+        _ = RefreshAsync();
     }
 
     private async Task RefreshAsync()
@@ -144,56 +228,169 @@ internal sealed class TrayApp : ApplicationContext
         UpdateDisplay();
         try
         {
-            var result = await Task.Run(() => reader.Read());
+#if UI_QA
+            await Task.Delay(10);
+            IReadOnlyList<MouseBattery> snapshot =
+            [
+                new("qa-a", new BatteryReading(80, false, "演示数据", DateTimeOffset.Now, "2.4G 接收器", "演示 · VGN F2")),
+                new("qa-b", new BatteryReading(35, false, "演示数据", DateTimeOffset.Now, "2.4G 接收器", "演示 · Keychron M5"))
+            ];
+#else
+            var snapshot = await Task.Run(() => reader.ReadAll());
+#endif
             if (exiting) return;
-            var percent = result.Percent is >= 0 and <= 100 ? result.Percent : null;
-            string model = string.IsNullOrWhiteSpace(result.Model) ? "鼠标电量" : result.Model;
-            bool sameDeviceStillPresent = result.Transport is not ("未连接" or "未知")
-                && string.Equals(model, current.Model, StringComparison.OrdinalIgnoreCase);
-            if (percent is null && current.Percent.HasValue && sameDeviceStillPresent)
-                current = current with { Stale = true, Message = result.Message };
-            else
-                current = new BatteryView(percent, result.Charging, result.Message, result.Timestamp, result.Transport, model);
-            if (lowBatteryPolicy.ShouldNotify(result, lowBatteryEnabled, lowBatteryThreshold))
+            string oldFixedId = display.FixedDeviceId;
+            display.ApplySnapshot(snapshot);
+            if (oldFixedId != display.FixedDeviceId) SaveSettings();
+            if (string.IsNullOrEmpty(detailsDeviceId))
+                detailsDeviceId = display.GetVisible().FirstOrDefault(d => !string.IsNullOrEmpty(d.DeviceId))?.DeviceId;
+            UpdateDisplay();
+            var warnings = new List<MouseBattery>();
+            foreach (var device in snapshot)
             {
-                tray.ShowBalloonTip(8_000, "鼠标电量较低", $"{current.Model} 剩余 {percent}%，已低于设定的 {lowBatteryThreshold}%，可以安排充电了。", ToolTipIcon.Warning);
+                if (string.IsNullOrEmpty(device.DeviceId) || device.Stale || device.Reading.Percent is null) continue;
+                if (!lowPolicies.TryGetValue(device.DeviceId, out var policy))
+                    lowPolicies[device.DeviceId] = policy = new LowBatteryPolicy();
+                if (policy.ShouldNotify(device.Reading, lowBatteryEnabled, lowBatteryThreshold))
+                    warnings.Add(device);
             }
+            if (warnings.Count == 1)
+                Notify("鼠标电量较低", $"{warnings[0].Reading.Model} 剩余 {warnings[0].Reading.Percent}%，已低于设定的 {lowBatteryThreshold}%，可以安排充电了。", ToolTipIcon.Warning, warnings[0].DeviceId);
+            else if (warnings.Count > 1)
+                Notify("多只鼠标电量较低", string.Join("\n", warnings.Select(d => $"{d.Reading.Model}：{d.Reading.Percent}%")), ToolTipIcon.Warning);
         }
         catch (Exception ex)
         {
-            if (exiting) return;
-            current = new BatteryView(null, false, "暂时无法读取电量：" + ex.Message, DateTimeOffset.Now, "", current.Model);
+            if (!exiting) Notify("暂时无法更新电量", ex.Message, ToolTipIcon.Warning);
         }
         finally
         {
             refreshing = false;
-            if (!exiting) UpdateDisplay();
+            if (!exiting)
+            {
+                UpdateDisplay();
+                if (refreshQueued) { refreshQueued = false; RequestImmediateRefresh(); }
+            }
         }
     }
 
     private void UpdateDisplay()
     {
         if (exiting) return;
-        var key = (current.Percent, current.Charging, showPercentage, UsesLightTaskbar(), current.Stale,
-            Math.Max(16, (int)Math.Round(16 * popup.DeviceDpi / 96d)));
-        if (renderedIcon != key)
+        var wanted = display.GetVisible();
+        // Fixed and rotating modes reuse the same shell icon when its device changes.
+        if (display.Mode != MouseDisplayMode.Tiled && wanted.Count == 1 && icons.Count == 1)
         {
-            var next = TrayIconRenderer.Create(key.Item1, key.Item2, key.Item3, key.Item4, key.Item5, iconSize:key.Item6);
-            var previous = currentIcon;
-            currentIcon = next;
-            tray.Icon = next;
-            renderedIcon = key;
-            previous?.Dispose();
+            var existing = icons.Single();
+            if (existing.Key != wanted[0].DeviceId)
+            {
+                icons.Clear();
+                icons[wanted[0].DeviceId] = existing.Value;
+            }
         }
-        string state = current.Percent is int p ? $"{p}% · {(current.Stale ? "上次读数（鼠标暂未响应）" : ChargeLabel(current))}" : "未读取到电量";
-        string tooltip = current.Model + " · " + state;
-        if (!string.IsNullOrWhiteSpace(current.Transport)) tooltip += "\n" + current.Transport;
-        if (current.Percent is null && !string.IsNullOrWhiteSpace(current.Message)) tooltip += "\n" + current.Message;
-        tooltip = tooltip.Length > 127 ? tooltip[..127] : tooltip;
-        if (tray.Text != tooltip) tray.Text = tooltip;
+        bool light = UsesLightTaskbar();
+        int size = Math.Max(16, (int)Math.Round(16 * popup.DeviceDpi / 96d));
+        foreach (var device in wanted)
+        {
+            if (!icons.TryGetValue(device.DeviceId, out var host))
+            {
+                host = new TrayIconHost(menu);
+                host.LeftClicked += (sender, _) => { if (sender is TrayIconHost clicked) TogglePopup(clicked.DeviceId); };
+                host.ContextRequested += (sender, _) => { if (sender is TrayIconHost clicked) contextDeviceId = clicked.DeviceId; };
+                icons.Add(device.DeviceId, host);
+            }
+            host.Update(device, showPercentage, light, size);
+        }
+        var wantedIds = wanted.Select(d => d.DeviceId).ToHashSet(StringComparer.Ordinal);
+        foreach (string removed in icons.Keys.Where(id => !wantedIds.Contains(id)).ToArray())
+        {
+            icons[removed].Dispose();
+            icons.Remove(removed);
+        }
         refreshItem.Enabled = !refreshing;
         refreshItem.Text = refreshing ? "正在刷新…" : "立即刷新";
+        ConfigureRotation();
         SyncPopupSettings();
+#if UI_QA
+        WriteQaState();
+#endif
+    }
+
+#if UI_QA
+    internal async Task RunQaSmokeAsync()
+    {
+        string resultPath = Path.Combine(AppContext.BaseDirectory, "qa-data", "integration.txt");
+        int checks = 0;
+        void Check(bool success, string description)
+        {
+            if (!success) throw new InvalidDataException(description);
+            checks++;
+        }
+        try
+        {
+            await RefreshAsync();
+            SetDisplayMode(MouseDisplayMode.Fixed);
+            SetFixedTarget("qa-b");
+            Check(icons.Count == 1 && icons.ContainsKey("qa-b"), "fixed target owns one matching icon");
+            Check(detailsDeviceId == "qa-b", "manually selecting a fixed target updates its details");
+            SetDisplayMode(MouseDisplayMode.Tiled);
+            Check(icons.Count == 2 && icons.ContainsKey("qa-a") && icons.ContainsKey("qa-b"), "tiled mode creates both icons");
+            Check(!menu.IsDisposed, "removing an icon preserves the shared menu");
+            SetDisplayMode(MouseDisplayMode.Rotate);
+            Check(icons.Count == 1 && rotationTimer.Enabled, "rotation owns one icon and starts its timer");
+            string before = icons.Keys.Single();
+            var reusable = icons.Values.Single();
+            detailsDeviceId = "qa-a";
+            display.GetDetails(detailsDeviceId);
+            display.RotateNext();
+            UpdateDisplay();
+            Check(icons.Keys.Single() != before && ReferenceEquals(reusable, icons.Values.Single()), "rotation reuses the shell icon");
+            Check(display.GetDetails(detailsDeviceId).DeviceId == "qa-a", "rotation keeps details pinned");
+            SetPollSeconds(120);
+            SetRotateSeconds(3);
+            Check(timer.Interval == 120000 && rotationTimer.Interval == 3000, "query and rotation intervals are independent");
+            Check(pollIntervalItem.DropDownItems.OfType<ToolStripMenuItem>().Single(i => i.Checked).Tag is 120, "query menu marks the selected interval");
+            SetDisplayMode(MouseDisplayMode.Fixed);
+            Check(!rotationTimer.Enabled && icons.Keys.Single() == "qa-b", "fixed mode stops rotation and restores its target");
+            for (int i=0;i<25;i++)
+            {
+                SetDisplayMode(MouseDisplayMode.Tiled);
+                SetDisplayMode(MouseDisplayMode.Fixed);
+            }
+            Check(icons.Count == 1 && !menu.IsDisposed, "repeated mode changes preserve one icon and the menu");
+            File.WriteAllText(resultPath, $"Passed {checks} simulated tray integration checks. No hardware was queried.");
+        }
+        catch (Exception ex)
+        {
+            Environment.ExitCode = 1;
+            File.WriteAllText(resultPath, ex.ToString());
+        }
+        finally { ExitThread(); }
+    }
+
+    private void WriteQaState()
+    {
+        try
+        {
+            string directory = Path.Combine(AppContext.BaseDirectory, "qa-data");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "state.json"), JsonSerializer.Serialize(new
+            {
+                Mode = display.Mode.ToString(), FixedDeviceId = display.FixedDeviceId,
+                DetailsDeviceId = detailsDeviceId, VisibleHostCount = icons.Count,
+                HostIds = icons.Keys.ToArray(), VisibleDeviceIds = display.GetVisible().Select(d => d.DeviceId).ToArray()
+            }, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { }
+    }
+#endif
+
+    private void ConfigureRotation()
+    {
+        bool run = display.Mode == MouseDisplayMode.Rotate && display.Devices.Count > 1;
+        rotationTimer.Interval = rotateSeconds * 1000;
+        if (run && !rotationTimer.Enabled) rotationTimer.Start();
+        else if (!run && rotationTimer.Enabled) rotationTimer.Stop();
     }
 
     private void SetShowPercentage(bool enabled)
@@ -204,11 +401,21 @@ internal sealed class TrayApp : ApplicationContext
         UpdateDisplay();
     }
 
-    private void OnTestNotificationRequested(object? sender, EventArgs e) => tray.ShowBalloonTip(8_000, "低电提醒测试",
-        $"这是一条测试通知。鼠标电量低于 {lowBatteryThreshold}% 时会提醒。", ToolTipIcon.Info);
+    private void OnTestNotificationRequested(object? sender, EventArgs e) => Notify("低电提醒测试",
+        $"这是一条测试通知。鼠标电量低于 {lowBatteryThreshold}% 时会提醒。");
+
+    private void Notify(string title, string text, ToolTipIcon kind = ToolTipIcon.Info, string? deviceId = null)
+    {
+        TrayIconHost? host = deviceId is not null && icons.TryGetValue(deviceId, out var exact) ? exact : icons.Values.FirstOrDefault();
+        host?.Notify(title, text, kind);
+    }
 
     private async Task ExportDeviceInformationAsync()
     {
+#if UI_QA
+        await Task.CompletedTask;
+        Notify("演示模式", "演示模式不会读取或导出真实设备信息。");
+#else
         if (exporting || exiting) return;
         exporting = true;
         exportItem.Enabled = false;
@@ -216,40 +423,27 @@ internal sealed class TrayApp : ApplicationContext
         {
             using var dialog = new SaveFileDialog
             {
-                Title = "导出设备接口信息",
-                FileName = "Device-report.json",
-                Filter = "JSON 文件 (*.json)|*.json",
-                DefaultExt = "json",
-                AddExtension = true,
-                OverwritePrompt = true,
-                CheckPathExists = true
+                Title = "导出设备接口信息", FileName = "Device-report.json", Filter = "JSON 文件 (*.json)|*.json",
+                DefaultExt = "json", AddExtension = true, OverwritePrompt = true, CheckPathExists = true
             };
             var choice = popup.Visible ? dialog.ShowDialog(popup) : dialog.ShowDialog();
             if (choice != DialogResult.OK) return;
             exportItem.Text = "正在导出设备信息…";
             string json = await Task.Run(() => JsonSerializer.Serialize(DeviceDiagnostics.Collect(), new JsonSerializerOptions
             {
-                WriteIndented = true,
-                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+                WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
             }));
             if (exiting) return;
             await File.WriteAllTextAsync(dialog.FileName, json);
-            if (!exiting)
-                tray.ShowBalloonTip(6_000, "设备信息已导出", "已导出设备接口信息，未包含设备路径或序列号", ToolTipIcon.Info);
+            if (!exiting) Notify("设备信息已导出", "已导出设备接口信息，未包含设备路径或序列号");
         }
-        catch (Exception ex)
-        {
-            if (!exiting) tray.ShowBalloonTip(6_000, "导出设备信息失败", ex.Message, ToolTipIcon.Warning);
-        }
+        catch (Exception ex) { if (!exiting) Notify("导出设备信息失败", ex.Message, ToolTipIcon.Warning); }
         finally
         {
             exporting = false;
-            if (!exiting)
-            {
-                exportItem.Enabled = true;
-                exportItem.Text = "导出设备信息…";
-            }
+            if (!exiting) { exportItem.Enabled = true; exportItem.Text = "导出设备信息…"; }
         }
+#endif
     }
 
     private void SetLowBatteryOptions(bool enabled, int threshold)
@@ -258,7 +452,7 @@ internal sealed class TrayApp : ApplicationContext
         if (lowBatteryEnabled == enabled && lowBatteryThreshold == threshold) return;
         lowBatteryEnabled = enabled;
         lowBatteryThreshold = threshold;
-        lowBatteryPolicy.Reset();
+        foreach (var policy in lowPolicies.Values) policy.Reset();
         SaveSettings();
         UpdateDisplay();
     }
@@ -266,18 +460,67 @@ internal sealed class TrayApp : ApplicationContext
     private void SetPollSeconds(int seconds)
     {
         seconds = NormalizePollSeconds(seconds);
-        if (pollSeconds == seconds)
-        {
-            SyncPopupSettings();
-            return;
-        }
+        if (pollSeconds == seconds) { SyncPopupSettings(); return; }
         pollSeconds = seconds;
         SaveSettings();
         timer.Interval = pollSeconds * 1000;
         UpdateDisplay();
     }
 
-    internal static int NormalizePollSeconds(int? seconds) => seconds is >= 5 and <= 120 ? seconds.Value : DefaultPollSeconds;
+    private void SetRotateSeconds(int seconds)
+    {
+        seconds = NormalizeRotateSeconds(seconds);
+        if (rotateSeconds == seconds) return;
+        rotateSeconds = seconds;
+        SaveSettings();
+        ConfigureRotation();
+        SyncPopupSettings();
+    }
+
+    private void SetDisplayMode(MouseDisplayMode mode)
+    {
+        if (!Enum.IsDefined(mode)) mode = MouseDisplayMode.Fixed;
+        if (display.Mode == mode) return;
+        display.Mode = mode;
+        SaveSettings();
+        UpdateDisplay();
+    }
+
+    private void SetFixedTarget(string deviceId)
+    {
+        if (display.FixedDeviceId == deviceId) return;
+        display.FixedDeviceId = deviceId;
+        detailsDeviceId = deviceId;
+        SaveSettings();
+        UpdateDisplay();
+    }
+
+    internal static int NormalizePollSeconds(int? seconds) => seconds.HasValue && PollChoices.Contains(seconds.Value) ? seconds.Value : DefaultPollSeconds;
+    internal static int NormalizeRotateSeconds(int? seconds) => seconds.HasValue && RotateChoices.Contains(seconds.Value) ? seconds.Value : DefaultRotateSeconds;
+
+    private List<ChoiceOption> DeviceChoices()
+    {
+        var devices = display.Devices;
+        var labels = devices.GroupBy(d => $"{d.Reading.Model} · {d.Reading.Transport}", StringComparer.OrdinalIgnoreCase);
+        var choices = new List<ChoiceOption>();
+        foreach (var group in labels)
+        {
+            int count = group.Count(), index = 0;
+            foreach (var device in group)
+            {
+                index++;
+                string label = group.Key + (count > 1 ? $" · {index}" : "");
+                choices.Add(new(device.DeviceId, label));
+            }
+        }
+        if (!string.IsNullOrEmpty(display.FixedDeviceId) && choices.All(c => c.Value != display.FixedDeviceId))
+        {
+            var missing = display.PeekDevice(display.FixedDeviceId);
+            choices.Insert(0, new(display.FixedDeviceId, missing.Reading.Model + " · 未连接"));
+        }
+        if (choices.Count == 0) choices.Add(new("", "等待鼠标连接", false));
+        return choices;
+    }
 
     private void SyncPopupSettings(bool forcePopup = false)
     {
@@ -287,65 +530,84 @@ internal sealed class TrayApp : ApplicationContext
         if (lowBatteryItem.Checked != lowBatteryEnabled) lowBatteryItem.Checked = lowBatteryEnabled;
         lowBatteryItem.Text = $"低电通知（低于 {lowBatteryThreshold}%）";
         foreach (ToolStripMenuItem choice in pollIntervalItem.DropDownItems) choice.Checked = (int)choice.Tag! == pollSeconds;
+        foreach (ToolStripMenuItem choice in rotationItem.DropDownItems) choice.Checked = (int)choice.Tag! == rotateSeconds;
+        foreach (ToolStripMenuItem choice in modeItem.DropDownItems) choice.Checked = (MouseDisplayMode)choice.Tag! == display.Mode;
+        fixedTargetItem.Enabled = display.Mode == MouseDisplayMode.Fixed;
+        rotationItem.Enabled = display.Mode == MouseDisplayMode.Rotate;
+        var choices = DeviceChoices();
+        string signature = string.Join("\n", choices.Select(c => c.Value + "|" + c.Text + "|" + c.Enabled));
+        if (signature != targetsSignature)
+        {
+            foreach (ToolStripItem old in fixedTargetItem.DropDownItems.Cast<ToolStripItem>().ToArray()) old.Dispose();
+            fixedTargetItem.DropDownItems.Clear();
+            foreach (var device in choices)
+            {
+                var item = new ToolStripMenuItem(device.Text) { Tag = device.Value, Enabled = device.Enabled };
+                item.Click += (_, _) => SetFixedTarget(device.Value);
+                fixedTargetItem.DropDownItems.Add(item);
+            }
+            targetsSignature = signature;
+        }
+        foreach (ToolStripMenuItem choice in fixedTargetItem.DropDownItems) choice.Checked = (string)choice.Tag! == display.FixedDeviceId;
         popup.PollSeconds = pollSeconds;
+        popup.SetDisplayOptions(display.Mode, display.FixedDeviceId, choices, pollSeconds, rotateSeconds);
         if (forcePopup || popup.Visible)
-            popup.SetState(current, refreshing, startup, showPercentage, lowBatteryEnabled, lowBatteryThreshold);
+        {
+            var details = display.GetDetails(detailsDeviceId);
+            var reading = details.Reading;
+            popup.SetState(new(reading.Percent, reading.Charging, reading.Message, reading.Timestamp, reading.Transport, reading.Model, details.Stale),
+                refreshing, startup, showPercentage, lowBatteryEnabled, lowBatteryThreshold);
+        }
     }
 
     private void SetStartup(bool enabled)
     {
+#if UI_QA
+        SyncPopupSettings();
+#else
         try
         {
             using var key = Registry.CurrentUser.CreateSubKey(RunKey);
-            if (enabled)
-            {
-                key.SetValue("VgnBattery", CurrentStartupCommand(), RegistryValueKind.String);
-            }
+            if (enabled) key.SetValue("VgnBattery", CurrentStartupCommand(), RegistryValueKind.String);
             else key.DeleteValue("VgnBattery", false);
         }
-        catch (Exception ex)
-        {
-            tray.ShowBalloonTip(6_000, "未能更改开机启动", ex.Message, ToolTipIcon.Warning);
-        }
+        catch (Exception ex) { Notify("未能更改开机启动", ex.Message, ToolTipIcon.Warning); }
         SyncPopupSettings();
+#endif
     }
 
     private static bool IsStartupEnabled()
     {
+#if UI_QA
+        return false;
+#else
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKey);
             return StartupRegistration.MatchesCurrentCommand(key?.GetValue("VgnBattery") as string, CurrentStartupCommand());
         }
         catch { return false; }
+#endif
     }
 
     private static string CurrentStartupCommand() => StartupRegistration.BuildCommand(Environment.ProcessPath, AppContext.BaseDirectory);
-
     private static void MigrateExistingStartupRegistration()
     {
+#if !UI_QA
         try
         {
-            // Opening an existing key never opts a user into startup. Only an
-            // existing nonempty application entry may follow this portable EXE.
-            using var key = Registry.CurrentUser.OpenSubKey(RunKey, writable: true);
+            using var key = Registry.CurrentUser.OpenSubKey(RunKey, writable:true);
             string? registered = key?.GetValue("VgnBattery") as string;
             if (string.IsNullOrWhiteSpace(registered)) return;
             string command = CurrentStartupCommand();
-            if (StartupRegistration.NeedsMigration(registered, command))
-                key!.SetValue("VgnBattery", command, RegistryValueKind.String);
+            if (StartupRegistration.NeedsMigration(registered, command)) key!.SetValue("VgnBattery", command, RegistryValueKind.String);
         }
-        catch
-        {
-            // A stale registration remains unchecked, and the settings switch
-            // can retry explicitly. Startup migration must not prevent launch.
-        }
+        catch { /* A stale item stays unchecked, and the user can explicitly retry. */ }
+#endif
     }
 
     internal static string ChargeLabel(BatteryView view) => view.Percent is null ? "等待鼠标连接"
-        : view.Charging ? "正在充电"
-        : view.Message.Contains("已充满", StringComparison.Ordinal) ? "已充满"
-        : "电池供电";
+        : view.Charging ? "正在充电" : view.Message.Contains("已充满", StringComparison.Ordinal) ? "已充满" : "电池供电";
 
     private void SaveSettings()
     {
@@ -356,11 +618,11 @@ internal sealed class TrayApp : ApplicationContext
             File.WriteAllText(temporary, JsonSerializer.Serialize(new AppSettings
             {
                 ShowPercentage = showPercentage, LowBatteryEnabled = lowBatteryEnabled, LowBatteryThreshold = lowBatteryThreshold,
-                PollSeconds = pollSeconds
+                PollSeconds = pollSeconds, RotateSeconds = rotateSeconds, Mode = display.Mode.ToString(), FixedDeviceId = display.FixedDeviceId
             }));
             File.Move(temporary, SettingsPath, true);
         }
-        catch (Exception ex) { tray.ShowBalloonTip(6_000, "设置暂未保存", ex.Message, ToolTipIcon.Warning); }
+        catch (Exception ex) { Notify("设置暂未保存", ex.Message, ToolTipIcon.Warning); }
     }
 
     private static bool UsesLightTaskbar()
@@ -376,32 +638,27 @@ internal sealed class TrayApp : ApplicationContext
     private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
         if (!exiting && popup.IsHandleCreated && !popup.IsDisposed)
-        {
             try { popup.BeginInvoke(UpdateDisplay); } catch (InvalidOperationException) { }
-        }
     }
 
     private void OnDisplaySettingsChanged(object? sender, EventArgs e)
     {
         if (!exiting && popup.IsHandleCreated && !popup.IsDisposed)
-        {
-            try { popup.BeginInvoke(() => { if (popup.Visible) popup.PositionNearTray(); }); } catch (InvalidOperationException) { }
-        }
+            try { popup.BeginInvoke(() => { if (popup.Visible) popup.PositionNearTray(); UpdateDisplay(); }); } catch (InvalidOperationException) { }
     }
 
     protected override void ExitThreadCore()
     {
         if (exiting) return;
         exiting = true;
-        timer.Stop();
-        timer.Dispose();
+        timer.Stop(); timer.Dispose();
+        rotationTimer.Stop(); rotationTimer.Dispose();
+        deviceDebounce.Stop(); deviceDebounce.Dispose();
         SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
-        tray.Visible = false;
-        var menu = tray.ContextMenuStrip;
-        tray.Dispose();
-        menu?.Dispose();
-        currentIcon?.Dispose();
+        foreach (var host in icons.Values) host.Dispose();
+        icons.Clear();
+        menu.Dispose();
         popup.Dispose();
         base.ExitThreadCore();
     }
@@ -412,6 +669,9 @@ internal sealed class TrayApp : ApplicationContext
         public bool LowBatteryEnabled { get; set; } = true;
         public int LowBatteryThreshold { get; set; } = 20;
         public int PollSeconds { get; set; } = DefaultPollSeconds;
+        public int RotateSeconds { get; set; } = DefaultRotateSeconds;
+        public string Mode { get; set; } = nameof(MouseDisplayMode.Fixed);
+        public string FixedDeviceId { get; set; } = "";
     }
     internal sealed record BatteryView(int? Percent, bool Charging, string Message, DateTimeOffset Timestamp, string Transport, string Model = "鼠标电量", bool Stale = false);
 }
@@ -431,6 +691,10 @@ internal sealed class BatteryPopup : Form
     private readonly CheckBox showPercentage;
     private readonly CheckBox lowBattery;
     private readonly ThresholdStepper notificationThreshold;
+    private readonly StyledChoiceButton modeChoice;
+    private readonly StyledChoiceButton fixedChoice;
+    private readonly StyledChoiceButton pollChoice;
+    private readonly StyledChoiceButton rotationChoice;
     private readonly BatteryCanvas battery;
     private bool settingState;
     public event EventHandler? StartupRequested;
@@ -438,10 +702,18 @@ internal sealed class BatteryPopup : Form
     public event EventHandler? LowBatteryOptionsRequested;
     public event EventHandler? TestNotificationRequested;
     public event EventHandler? DevicesChanged;
+    public event EventHandler? PollRequested;
+    public event EventHandler? ModeRequested;
+    public event EventHandler? FixedTargetRequested;
+    public event EventHandler? RotationRequested;
     public bool StartupChecked => startup.Checked;
     public bool PercentageChecked => showPercentage.Checked;
     public bool LowBatteryChecked => lowBattery.Checked;
     public int NotificationThreshold => (int)notificationThreshold.Value;
+    public MouseDisplayMode SelectedDisplayMode => Enum.TryParse<MouseDisplayMode>(modeChoice.SelectedValue, out var mode) ? mode : MouseDisplayMode.Fixed;
+    public string SelectedFixedDeviceId => fixedChoice.SelectedValue;
+    public int SelectedPollSeconds => int.TryParse(pollChoice.SelectedValue, out int seconds) ? seconds : TrayApp.DefaultPollSeconds;
+    public int SelectedRotateSeconds => int.TryParse(rotationChoice.SelectedValue, out int seconds) ? seconds : TrayApp.DefaultRotateSeconds;
 
     [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     internal int PollSeconds { get; set; } = TrayApp.DefaultPollSeconds;
@@ -452,7 +724,7 @@ internal sealed class BatteryPopup : Form
         // entire 96-DPI control tree intact until all bounds/fonts are established.
         SuspendLayout();
         AutoScaleMode = AutoScaleMode.Dpi;
-        ClientSize = new Size(350, 438);
+        ClientSize = new Size(350, 574);
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = FormStartPosition.Manual;
@@ -466,12 +738,12 @@ internal sealed class BatteryPopup : Form
 
         var layout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7,
+            Dock = DockStyle.Top, Height = 534, ColumnCount = 1, RowCount = 7,
             Margin = Padding.Empty, Padding = Padding.Empty, BackColor = Background
         };
         layout.SuspendLayout();
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        foreach (int height in new[] { 32, 26, 86, 36, 22, 178, 18 })
+        foreach (int height in new[] { 32, 26, 86, 36, 22, 314, 18 })
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
 
         var heading = new TableLayoutPanel
@@ -551,12 +823,12 @@ internal sealed class BatteryPopup : Form
         settingsCard.SuspendLayout();
         var settings = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5,
+            Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 9,
             Margin = Padding.Empty, Padding = Padding.Empty, BackColor = SettingsPalette.Card
         };
         settings.SuspendLayout();
         settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        foreach (int height in new[] { 34, 34, 34, 8, 40 })
+        foreach (int height in new[] { 34, 34, 34, 8, 40, 34, 34, 34, 34 })
             settings.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
         startup = MakeCheckBox("开机自动运行", divider:true);
         startup.AccessibleDescription = "登录 Windows 后自动在任务栏显示鼠标电量";
@@ -606,13 +878,27 @@ internal sealed class BatteryPopup : Form
         testNotification.Click += (_, _) => TestNotificationRequested?.Invoke(this, EventArgs.Empty);
         lowBatteryRow.Controls.Add(testNotification, 3, 0);
         settings.Controls.Add(lowBatteryRow, 0, 4);
+        modeChoice = MakeChoice("托盘显示方式");
+        modeChoice.SelectionChanged += (_, _) => { if (!settingState) ModeRequested?.Invoke(this, EventArgs.Empty); };
+        AddChoiceRow(settings, 5, "显示方式", modeChoice);
+        fixedChoice = MakeChoice("固定显示的鼠标");
+        fixedChoice.SelectionChanged += (_, _) => { if (!settingState) FixedTargetRequested?.Invoke(this, EventArgs.Empty); };
+        AddChoiceRow(settings, 6, "固定目标", fixedChoice);
+        pollChoice = MakeChoice("鼠标电量查询间隔");
+        pollChoice.SelectionChanged += (_, _) => { if (!settingState) PollRequested?.Invoke(this, EventArgs.Empty); };
+        AddChoiceRow(settings, 7, "查询间隔", pollChoice);
+        rotationChoice = MakeChoice("托盘图标轮换间隔");
+        rotationChoice.SelectionChanged += (_, _) => { if (!settingState) RotationRequested?.Invoke(this, EventArgs.Empty); };
+        AddChoiceRow(settings, 8, "轮换间隔", rotationChoice);
         settingsCard.Controls.Add(settings);
         layout.Controls.Add(settingsCard, 0, 5);
-        hint = MakeLabel("自动更新 · 每 45 秒", 8F);
+        hint = MakeLabel("自动查询 · 每 30 秒", 8F);
         hint.ForeColor = Color.FromArgb(113, 125, 143);
         hint.TextAlign = ContentAlignment.MiddleLeft;
         layout.Controls.Add(hint, 0, 6);
-        Controls.Add(layout);
+        var viewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Background, Margin = Padding.Empty };
+        viewport.Controls.Add(layout);
+        Controls.Add(viewport);
 
         EnableWindowDragging(this);
         KeyPreview = true;
@@ -628,7 +914,25 @@ internal sealed class BatteryPopup : Form
         settingsCard.ResumeLayout(false);
         layout.ResumeLayout(false);
         ResumeLayout(true);
+        SetDisplayOptions(MouseDisplayMode.Fixed, "", [new ChoiceOption("", "等待鼠标连接", false)], TrayApp.DefaultPollSeconds, TrayApp.DefaultRotateSeconds);
         WriteLayoutDiagnostics();
+    }
+
+    public void SetDisplayOptions(MouseDisplayMode mode, string fixedId, IReadOnlyList<ChoiceOption> devices, int pollSeconds, int rotateSeconds)
+    {
+        if (IsDisposed) return;
+        settingState = true;
+        try
+        {
+            modeChoice.SetChoices(Enum.GetValues<MouseDisplayMode>().Select(m => new ChoiceOption(m.ToString(), TrayApp.ModeLabel(m))).ToArray(), mode.ToString());
+            fixedChoice.SetChoices(devices, fixedId);
+            fixedChoice.Enabled = mode == MouseDisplayMode.Fixed && devices.Any(d => d.Enabled);
+            pollChoice.SetChoices(TrayApp.PollChoices.Select(s => new ChoiceOption(s.ToString(), $"每 {s} 秒")).ToArray(), pollSeconds.ToString());
+            rotationChoice.SetChoices(TrayApp.RotateChoices.Select(s => new ChoiceOption(s.ToString(), $"每 {s} 秒")).ToArray(), rotateSeconds.ToString());
+            rotationChoice.Enabled = mode == MouseDisplayMode.Rotate;
+            PollSeconds = pollSeconds;
+        }
+        finally { settingState = false; }
     }
 
     public void SetState(TrayApp.BatteryView view, bool refreshing, bool startupEnabled, bool showTrayPercentage, bool lowBatteryEnabled, int lowBatteryThreshold)
@@ -648,16 +952,19 @@ internal sealed class BatteryPopup : Form
         Text = title.Text + " · 鼠标电量";
         percentage.Text = view.Percent is int p ? $"{p}%" : "—";
         percentage.ForeColor = view.Stale || view.Percent is null ? Secondary : Color.FromArgb(115, 227, 167);
-        connection.Text = view.Stale ? "上次读数 · 鼠标暂未响应"
+        bool disconnected = view.Transport == "未连接";
+        connection.Text = disconnected ? "设备未连接"
+            : view.Stale ? "上次读数 · 鼠标暂未响应"
             : view.Percent is not null ? "已连接 · " + (string.IsNullOrWhiteSpace(view.Transport) ? "鼠标" : view.Transport)
             : refreshing ? "正在读取电量…" : "暂未读取到电量";
         connection.ForeColor = view.Percent is not null && !view.Stale ? Color.FromArgb(118, 215, 178) : Secondary;
-        chargeState.Text = view.Stale ? "等待鼠标唤醒"
+        chargeState.Text = disconnected ? "等待重新连接" : view.Stale ? "等待鼠标唤醒"
             : view.Percent is int remaining && lowBatteryEnabled && remaining < lowBatteryThreshold && !view.Charging ? "电量较低，建议充电"
             : TrayApp.ChargeLabel(view);
-        message.Text = view.Stale ? "移动鼠标后会自动更新，当前显示最近一次读数。" : view.Message;
-        hint.Text = $"自动更新 · 每 {PollSeconds} 秒";
-        updated.Text = (view.Stale ? "上次读数 · " : view.Percent is null ? "最近尝试 · " : "已更新 · ") + view.Timestamp.LocalDateTime.ToString("HH:mm:ss");
+        message.Text = disconnected ? view.Message : view.Stale ? "移动鼠标后会自动更新，当前显示最近一次读数。" : view.Message;
+        hint.Text = $"自动查询 · 每 {PollSeconds} 秒" + (SelectedDisplayMode == MouseDisplayMode.Rotate ? $" · 每 {SelectedRotateSeconds} 秒轮换" : "");
+        updated.Text = view.Timestamp == DateTimeOffset.MinValue ? "尚无读数"
+            : (view.Stale ? "上次读数 · " : view.Percent is null ? "最近尝试 · " : "已更新 · ") + view.Timestamp.LocalDateTime.ToString("HH:mm:ss");
         battery.Percent = view.Percent;
         battery.Charging = !view.Stale && view.Charging;
         battery.Stale = view.Stale;
@@ -671,6 +978,8 @@ internal sealed class BatteryPopup : Form
         var screen = Screen.FromPoint(cursor);
         var area = screen.WorkingArea;
         int margin = (int)Math.Round(12 * DeviceDpi / 96F);
+        int desiredHeight = (int)Math.Round(574 * DeviceDpi / 96F);
+        Height = Math.Min(desiredHeight, Math.Max(200, area.Height - margin * 2));
         int x = Math.Clamp(cursor.X - Width + margin * 2, area.Left + margin, Math.Max(area.Left + margin, area.Right - Width - margin));
         int y = cursor.Y < area.Top + margin * 2 ? area.Top + margin : area.Bottom - Height - margin;
         Location = new Point(x, Math.Max(area.Top + margin, y));
@@ -719,7 +1028,11 @@ internal sealed class BatteryPopup : Form
             }
             Add(this);
             var data = new { DeviceDpi, ClientSize = new { ClientSize.Width, ClientSize.Height }, AutoScaleDimensions, CurrentAutoScaleDimensions, Controls = nodes };
+#if UI_QA
+            string directory = Path.Combine(AppContext.BaseDirectory, "qa-data");
+#else
             string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VgnBattery");
+#endif
             Directory.CreateDirectory(directory);
             File.WriteAllText(Path.Combine(directory, "layout.json"), JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true }));
         }
@@ -749,6 +1062,32 @@ internal sealed class BatteryPopup : Form
         Text = text, Dock = DockStyle.Fill, Margin = Padding.Empty,
         Font = new Font("Microsoft YaHei UI", 9.5F)
     };
+
+    private static StyledChoiceButton MakeChoice(string name) => new()
+    {
+        Anchor = AnchorStyles.Left | AnchorStyles.Right, Height = 28, Margin = Padding.Empty,
+        Font = new Font("Microsoft YaHei UI", 9F), AccessibleName = name
+    };
+
+    private static void AddChoiceRow(TableLayoutPanel settings, int row, string text, StyledChoiceButton choice)
+    {
+        var panel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty,
+            BackColor = SettingsPalette.Card
+        };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 66));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        var label = MakeLabel(text, 9F);
+        label.BackColor = SettingsPalette.Card;
+        label.ForeColor = Secondary;
+        label.TextAlign = ContentAlignment.MiddleLeft;
+        label.Margin = new Padding(4, 0, 0, 0);
+        panel.Controls.Add(label, 0, 0);
+        panel.Controls.Add(choice, 1, 0);
+        settings.Controls.Add(panel, 0, row);
+    }
 }
 internal sealed class BatteryCanvas : Control
 {

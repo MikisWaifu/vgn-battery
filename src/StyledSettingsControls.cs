@@ -3,6 +3,103 @@ using System.Drawing.Drawing2D;
 
 namespace VgnBattery;
 
+internal sealed record ChoiceOption(string Value, string Text, bool Enabled = true);
+
+internal sealed class StyledChoiceButton : Button
+{
+    private IReadOnlyList<ChoiceOption> choices = [];
+    private string choicesKey = "";
+    private string selectedValue = "";
+    private ContextMenuStrip? openMenu;
+    private bool hovered;
+    internal event EventHandler? SelectionChanged;
+    internal string SelectedValue => selectedValue;
+
+    internal StyledChoiceButton()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        BackColor = SettingsPalette.Field;
+        ForeColor = SettingsPalette.Text;
+        Cursor = Cursors.Hand;
+        TextAlign = ContentAlignment.MiddleLeft;
+    }
+
+    internal void SetChoices(IReadOnlyList<ChoiceOption> options, string selected)
+    {
+        string key = string.Join("\n", options.Select(o => o.Value + "|" + o.Text + "|" + o.Enabled));
+        if (choicesKey == key && selectedValue == selected) return;
+        choices = options;
+        choicesKey = key;
+        selectedValue = selected;
+        Text = choices.FirstOrDefault(c => c.Value == selected)?.Text ?? "请选择";
+        AccessibleDescription = Text;
+        Invalidate();
+    }
+
+    protected override void OnClick(EventArgs e)
+    {
+        base.OnClick(e);
+        if (!Enabled || choices.Count == 0) return;
+        openMenu?.Dispose();
+        var dropdown = new ContextMenuStrip
+        {
+            ShowImageMargin = false, ShowCheckMargin = true, Renderer = new DarkMenuRenderer(),
+            BackColor = SettingsPalette.Card, ForeColor = SettingsPalette.Text,
+            Font = Font, Padding = new Padding(4)
+        };
+        foreach (var option in choices)
+        {
+            var item = new ToolStripMenuItem(option.Text) { Checked = option.Value == selectedValue, Enabled = option.Enabled };
+            item.Click += (_, _) =>
+            {
+                if (selectedValue == option.Value) return;
+                selectedValue = option.Value;
+                Text = option.Text;
+                AccessibleDescription = option.Text;
+                Invalidate();
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+            };
+            dropdown.Items.Add(item);
+        }
+        dropdown.Closed += (_, _) => { if (openMenu == dropdown) openMenu = null; dropdown.Dispose(); };
+        openMenu = dropdown;
+        dropdown.Show(this, new Point(0, Height));
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hovered = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hovered = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        float scale = DeviceDpi / 96F;
+        e.Graphics.Clear(Parent?.BackColor ?? SettingsPalette.Card);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using var path = SettingsPalette.Round(new RectangleF(.5F, .5F, Width - 1, Height - 1), 6 * scale);
+        using var fill = new SolidBrush(hovered && Enabled ? SettingsPalette.Hover : BackColor);
+        e.Graphics.FillPath(fill, path);
+        using var border = new Pen(SettingsPalette.Border, Math.Max(1, scale));
+        e.Graphics.DrawPath(border, path);
+        int inset = (int)Math.Round(9 * scale);
+        int arrowWidth = (int)Math.Round(22 * scale);
+        TextRenderer.DrawText(e.Graphics, Text, Font, new Rectangle(inset, 0, Math.Max(1, Width - inset - arrowWidth), Height),
+            Enabled ? ForeColor : SettingsPalette.Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+        using var arrow = new Pen(SettingsPalette.Muted, Math.Max(1.2F, scale)) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+        float cx = Width - arrowWidth / 2F, cy = Height / 2F;
+        e.Graphics.DrawLines(arrow, [new PointF(cx - 3 * scale, cy - scale), new PointF(cx, cy + 2 * scale), new PointF(cx + 3 * scale, cy - scale)]);
+        if (Focused && ShowFocusCues)
+            ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(ClientRectangle, -(int)(4 * scale), -(int)(4 * scale)), SettingsPalette.Muted, BackColor);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { openMenu?.Dispose(); openMenu = null; }
+        base.Dispose(disposing);
+    }
+}
+
 internal static class SettingsPalette
 {
     internal static readonly Color Card = Color.FromArgb(34, 40, 49);

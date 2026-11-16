@@ -21,6 +21,14 @@ jobs:
       - name: Build and run offline checks
         shell: pwsh
         run: ./build-release.ps1
+      - name: Check simulated multi-device tray behavior
+        shell: pwsh
+        run: |
+          dotnet build src/VgnBattery.csproj -c Release -p:DefineConstants=UI_QA -o artifacts/qa --nologo
+          if ($LASTEXITCODE -ne 0) { throw 'QA build failed' }
+          $qa = Start-Process -FilePath (Join-Path $PWD 'artifacts/qa/VgnBattery.exe') -ArgumentList '--qa-smoke' -WindowStyle Hidden -Wait -PassThru
+          Get-Content artifacts/qa/qa-data/integration.txt
+          if ($qa.ExitCode -ne 0) { throw 'Simulated tray integration checks failed' }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: VgnBattery-win-x64

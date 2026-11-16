@@ -1,5 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Encodings.Web;
 
@@ -20,8 +22,19 @@ internal sealed class BatteryReader
     private int enumerationInvalidated = 1;
     private DateTimeOffset nextEnumeration;
     private List<HidDevice>? cachedDevices;
-    private string? lastTelemetry;
-    private string? keychronModel;
+    private readonly object readGate = new();
+    private readonly object cacheGate = new();
+    private static readonly object LogGate = new();
+    private readonly Dictionary<string, string> lastTelemetry = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ModelCacheEntry> keychronModels = new(StringComparer.Ordinal);
+    private long modelGeneration;
+    private static readonly TimeSpan ModelLifetime = TimeSpan.FromSeconds(60);
+    private static readonly JsonSerializerOptions StatusOptions = new()
+    {
+        WriteIndented = true, Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
+
+    private sealed record ModelCacheEntry(string Model, DateTimeOffset ExpiresAt);
 
     private static byte[] Command(int length, byte reportId, byte command)
     {
@@ -33,10 +46,24 @@ internal sealed class BatteryReader
 
     public void InvalidateDevices()
     {
-        // A different mouse may be paired to the same receiver.
-        keychronModel = null;
+        lock (cacheGate)
+        {
+            // Do not let an in-flight lookup repopulate an invalidated cache.
+            modelGeneration++;
+            keychronModels.Clear();
+        }
         Interlocked.Exchange(ref enumerationInvalidated,1);
     }
+
+    private void ForgetModel(string deviceId)
+    {
+        lock (cacheGate) keychronModels.Remove(deviceId);
+    }
+
+    private static string NormalizeDevicePath(string path) => path.Trim().Replace('/', '\\').ToUpperInvariant();
+
+    internal static string DeviceIdForPath(string path) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(NormalizeDevicePath(path))));
 
     private List<HidDevice> GetDevices()
     {
@@ -50,61 +77,124 @@ internal sealed class BatteryReader
 
     public BatteryReading Read()
     {
-        BatteryReading result;
+        var readings = ReadAll();
+        var result = (readings.FirstOrDefault(mouse => mouse.Reading.Percent.HasValue) ?? readings[0]).Reading;
+        WriteStatus("status.json", result);
+        return result;
+    }
+
+    public IReadOnlyList<MouseBattery> ReadAll()
+    {
+        // UI refreshes already serialize reads. This also protects callers that
+        // invoke the CLI-compatible API and ReadAll on the same reader instance.
+        lock (readGate)
+        {
+            var results = ReadAllAsync().GetAwaiter().GetResult();
+            WriteStatus("devices-status.json", results);
+            return results;
+        }
+    }
+
+    private async Task<IReadOnlyList<MouseBattery>> ReadAllAsync()
+    {
+        List<(HidDevice Device, DeviceProfile Profile, string DeviceId)> devices;
         try
         {
             var discovered = GetDevices();
-            var devices = new List<(HidDevice Device, DeviceProfile Profile)>();
+            devices = [];
+            var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var device in discovered)
                 if (DeviceCatalog.Find(device.VendorId,device.ProductId) is { } profile && profile.Matches(device))
-                    devices.Add((device,profile));
-            // Wired first, then a stable order: two connected mice must not make
-            // the reading alternate between them.
+                {
+                    string deviceId = DeviceIdForPath(device.Path);
+                    if (seen.Add(deviceId)) devices.Add((device, profile, deviceId));
+                }
             devices = devices.OrderBy(d => d.Profile.Wired ? 0 : 1)
-                .ThenBy(d => d.Device.VendorId).ThenBy(d => d.Device.ProductId).ToList();
-            result = new(null, false, "未发现受支持的 USB 鼠标", DateTimeOffset.Now, "未连接");
-            if (devices.Count==0 && discovered.Count>0)
+                .ThenBy(d => d.Device.VendorId).ThenBy(d => d.Device.ProductId)
+                .ThenBy(d => NormalizeDevicePath(d.Device.Path), StringComparer.Ordinal).ToList();
+            PruneCaches(seen);
+            if (devices.Count == 0)
             {
-                var candidate=discovered.FirstOrDefault(d=>d.UsagePage >= 0xff00) ?? discovered[0];
-                result = new(null,false,"已识别设备，但尚未支持它的电量协议",DateTimeOffset.Now,"USB",DeviceCatalog.Model(candidate,null));
-            }
-            foreach (var (device, profile) in devices)
-            {
-                try
+                BatteryReading result = new(null, false, "未发现受支持的 USB 鼠标", DateTimeOffset.Now, "未连接");
+                if (discovered.Count > 0)
                 {
-                    result = QueryAsync(device, profile).GetAwaiter().GetResult();
-                    if (result.Percent.HasValue) break;
+                    var candidate = discovered.FirstOrDefault(d => d.UsagePage >= 0xff00) ?? discovered[0];
+                    result = new(null, false, "已识别设备，但尚未支持它的电量协议", DateTimeOffset.Now, "USB", DeviceCatalog.Model(candidate, null));
                 }
-                catch (OperationCanceledException) { result = new(null, false, "暂未响应，可能休眠或已切换模式；将自动重试", DateTimeOffset.Now, "USB 接收器 / 有线", DeviceCatalog.Model(device, profile)); }
-                catch (Exception ex) when (ex is IOException or Win32Exception or UnauthorizedAccessException)
-                {
-                    InvalidateDevices();
-                    result = new(null, false, "暂时无法读取，请关闭鼠标驱动后重试", DateTimeOffset.Now, "USB 接收器 / 有线", DeviceCatalog.Model(device, profile));
-                    Log("Query: " + ex.Message);
-                }
+                return [new MouseBattery("", result)];
             }
         }
         catch (Exception ex)
         {
             Log("Enumeration: " + ex.Message);
-            result = new(null, false, "读取失败，请稍后重试", DateTimeOffset.Now, "未知");
+            return [new MouseBattery("", new(null, false, "读取失败，请稍后重试", DateTimeOffset.Now, "未知"))];
         }
+
+        using var parallelism = new SemaphoreSlim(4, 4);
+        // WhenAll retains input order. A sleeping receiver has its own timeout
+        // and cannot stop other receivers from being queried concurrently.
+        return await Task.WhenAll(devices.Select(d => ReadDeviceAsync(d.Device, d.Profile, d.DeviceId, parallelism)))
+            .ConfigureAwait(false);
+    }
+
+    private async Task<MouseBattery> ReadDeviceAsync(HidDevice device, DeviceProfile profile, string deviceId, SemaphoreSlim parallelism)
+    {
+        await parallelism.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            return new(deviceId, await QueryAsync(device, profile, deviceId).ConfigureAwait(false));
+        }
+        catch (OperationCanceledException)
+        {
+            ForgetModel(deviceId);
+            return new(deviceId, Unknown(device, profile, "暂未响应，可能休眠或已切换模式；将自动重试"));
+        }
+        catch (Exception ex) when (ex is IOException or Win32Exception or UnauthorizedAccessException)
+        {
+            ForgetModel(deviceId);
+            Interlocked.Exchange(ref enumerationInvalidated, 1);
+            Log("Query " + deviceId + ": " + ex.Message);
+            return new(deviceId, Unknown(device, profile, "暂时无法读取，请关闭鼠标驱动后重试"));
+        }
+        catch (Exception ex)
+        {
+            ForgetModel(deviceId);
+            Log("Query " + deviceId + ": " + ex.Message);
+            return new(deviceId, Unknown(device, profile, "读取失败，请稍后重试"));
+        }
+        finally { parallelism.Release(); }
+    }
+
+    private static BatteryReading Unknown(HidDevice device, DeviceProfile profile, string message) =>
+        new(null, false, message, DateTimeOffset.Now, profile.Wired ? "USB 有线" : "2.4 GHz USB 接收器", DeviceCatalog.Model(device, profile));
+
+    private void PruneCaches(HashSet<string> present)
+    {
+        lock (cacheGate)
+        {
+            foreach (string id in keychronModels.Keys.Where(id => !present.Contains(id)).ToArray()) keychronModels.Remove(id);
+            foreach (string id in lastTelemetry.Keys.Where(id => !present.Contains(id)).ToArray()) lastTelemetry.Remove(id);
+        }
+    }
+
+    private static void WriteStatus(string fileName, object value)
+    {
         try
         {
             Directory.CreateDirectory(DataDirectory);
-            File.WriteAllText(Path.Combine(DataDirectory, "status.json"), JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented=true, Encoder=JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
+            File.WriteAllText(Path.Combine(DataDirectory, fileName), JsonSerializer.Serialize(value, StatusOptions));
         }
-        catch { /* A status file is diagnostic only. */ }
-        return result;
+        catch { /* Diagnostic files never interfere with device reads. */ }
     }
 
-    private Task<BatteryReading> QueryAsync(HidDevice device, DeviceProfile profile) => profile.Protocol switch
+    private Task<BatteryReading> QueryAsync(HidDevice device, DeviceProfile profile, string deviceId) => profile.Protocol switch
     {
-        BatteryProtocol.Keychron64 => QueryKeychronAsync(device, profile),
-        _ => QueryVgnAsync(device, profile)
+        BatteryProtocol.Keychron64 => QueryKeychronAsync(device, profile, deviceId),
+        BatteryProtocol.Vgn17 => QueryVgnAsync(device, profile, deviceId),
+        _ => Task.FromResult(Unknown(device, profile, "暂不支持此电量协议"))
     };
 
-    private async Task<BatteryReading> QueryVgnAsync(HidDevice device, DeviceProfile profile)
+    private async Task<BatteryReading> QueryVgnAsync(HidDevice device, DeviceProfile profile, string deviceId)
     {
         using var handle = NativeHid.Open(device.Path, write:true, overlapped:true);
         if (handle.IsInvalid) throw new Win32Exception();
@@ -113,7 +203,7 @@ internal sealed class BatteryReader
         for (int i=0;i<4;i++)
         {
             using var drainTimeout = new CancellationTokenSource(30);
-            try { await stream.ReadAsync(new byte[17], drainTimeout.Token).ConfigureAwait(false); }
+            try { if (await stream.ReadAsync(new byte[17], drainTimeout.Token).ConfigureAwait(false) == 0) break; }
             catch (OperationCanceledException) { break; }
         }
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -125,20 +215,22 @@ internal sealed class BatteryReader
         while (watch.Elapsed < TimeSpan.FromSeconds(2))
         {
             int length = await stream.ReadAsync(buffer.AsMemory(), token).ConfigureAwait(false);
+            if (length == 0) break;
             if (length == 17 && buffer[0] == 0x08 && buffer[1] == 0x04)
             {
                 var result = Parse(buffer, device.ProductId, profile.Wired) with { Model=DeviceCatalog.Model(device,profile) };
                 if (result.Percent.HasValue)
                 {
-                    LogTelemetry(buffer, result);
+                    LogTelemetry(deviceId, buffer, result);
                     return result;
                 }
             }
         }
-        return new(null, false, "未收到有效电量数据", DateTimeOffset.Now, "USB 接收器 / 有线");
+        ForgetModel(deviceId);
+        return Unknown(device, profile, "未收到有效电量数据");
     }
 
-    private async Task<BatteryReading> QueryKeychronAsync(HidDevice device, DeviceProfile profile)
+    private async Task<BatteryReading> QueryKeychronAsync(HidDevice device, DeviceProfile profile, string deviceId)
     {
         using var handle = NativeHid.Open(device.Path, write:true, overlapped:true);
         if (handle.IsInvalid) throw new Win32Exception();
@@ -146,7 +238,7 @@ internal sealed class BatteryReader
         for (int i=0;i<4;i++)
         {
             using var drainTimeout = new CancellationTokenSource(30);
-            try { await stream.ReadAsync(new byte[64], drainTimeout.Token).ConfigureAwait(false); }
+            try { if (await stream.ReadAsync(new byte[64], drainTimeout.Token).ConfigureAwait(false) == 0) break; }
             catch (OperationCanceledException) { break; }
         }
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
@@ -157,25 +249,34 @@ internal sealed class BatteryReader
         while (watch.Elapsed < TimeSpan.FromSeconds(2))
         {
             int length = await stream.ReadAsync(buffer.AsMemory(), token).ConfigureAwait(false);
+            if (length == 0) break;
             if (length >= 21 && buffer[0] == 0xb4 && buffer[1] == 0x06)
             {
                 var result = ParseKeychron(buffer, profile.Wired);
                 if (result.Percent.HasValue)
                 {
-                    result = result with { Model=await ResolveKeychronModelAsync(stream, device, profile).ConfigureAwait(false) };
-                    LogTelemetry(buffer, result);
+                    result = result with { Model=await ResolveKeychronModelAsync(stream, device, profile, deviceId).ConfigureAwait(false) };
+                    LogTelemetry(deviceId, buffer, result);
                     return result;
                 }
             }
         }
-        return new(null, false, "未收到有效电量数据", DateTimeOffset.Now, "USB 接收器 / 有线");
+        ForgetModel(deviceId);
+        return Unknown(device, profile, "未收到有效电量数据");
     }
 
-    private async Task<string> ResolveKeychronModelAsync(FileStream stream, HidDevice device, DeviceProfile profile)
+    private async Task<string> ResolveKeychronModelAsync(FileStream stream, HidDevice device, DeviceProfile profile, string deviceId)
     {
         string fallback = DeviceCatalog.Model(device, profile);
         if (!profile.QueryModel) return fallback;
-        if (keychronModel is not null) return keychronModel;
+        long generation;
+        lock (cacheGate)
+        {
+            if (keychronModels.TryGetValue(deviceId, out var cached) && cached.ExpiresAt > DateTimeOffset.UtcNow)
+                return cached.Model;
+            keychronModels.Remove(deviceId);
+            generation = modelGeneration;
+        }
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
@@ -186,35 +287,53 @@ internal sealed class BatteryReader
             while (watch.Elapsed < TimeSpan.FromSeconds(1))
             {
                 int length = await stream.ReadAsync(buffer.AsMemory(), token).ConfigureAwait(false);
-                // The reply carries the command echo, not the request report ID.
-                if (length < 18 || buffer[1] != 0x03) continue;
-                for (int slot=0; slot<3; slot++)
+                if (length == 0) break;
+                if (length < 8 || buffer[0] != 0xb6 || buffer[1] != 0x03) continue;
+                string model = ParseKeychronModel(buffer.AsSpan(0, length)) ?? fallback;
+                lock (cacheGate)
                 {
-                    int offset = 3 + slot * 5;
-                    if (offset + 5 > length) break;
-                    if (buffer[offset + 4] != 1) continue;
-                    ushort vendor = (ushort)(buffer[offset] | buffer[offset + 1] << 8);
-                    ushort product = (ushort)(buffer[offset + 2] | buffer[offset + 3] << 8);
-                    keychronModel = DeviceCatalog.Find(vendor, product)?.FallbackName;
-                    return keychronModel ?? fallback;
+                    if (generation == modelGeneration)
+                        keychronModels[deviceId] = new(model, DateTimeOffset.UtcNow.Add(ModelLifetime));
                 }
-                break;
+                return model;
             }
         }
-        catch (Exception ex) when (ex is OperationCanceledException or IOException)
+        catch (Exception ex)
         {
             // The model name is cosmetic; a failed lookup must not discard a valid reading.
+            ForgetModel(deviceId);
             Log("Model query: " + ex.Message);
         }
         return fallback;
     }
 
-    private void LogTelemetry(byte[] report, BatteryReading result)
+    internal static string? ParseKeychronModel(ReadOnlySpan<byte> report)
+    {
+        if (report.Length < 8 || report[0] != 0xb6 || report[1] != 0x03) return null;
+        for (int slot = 0; slot < 3; slot++)
+        {
+            int offset = 3 + slot * 5;
+            if (offset + 5 > report.Length) break;
+            if (report[offset + 4] != 1) continue;
+            ushort vendor = (ushort)(report[offset] | report[offset + 1] << 8);
+            ushort product = (ushort)(report[offset + 2] | report[offset + 3] << 8);
+            // Other slots may belong to unknown products. Only name a registered
+            // Keychron mouse, and keep scanning rather than guessing another brand.
+            if (DeviceCatalog.Find(vendor, product) is { Protocol: BatteryProtocol.Keychron64, Wired: true } profile)
+                return profile.FallbackName;
+        }
+        return null;
+    }
+
+    private void LogTelemetry(string deviceId, byte[] report, BatteryReading result)
     {
         string telemetry = $"{result.Model}|{result.Percent}|{result.Charging}|{result.Transport}";
-        if (lastTelemetry == telemetry) return;
-        Log("Battery response: " + Convert.ToHexString(report, 0, Math.Min(report.Length, 21)));
-        lastTelemetry = telemetry;
+        lock (cacheGate)
+        {
+            if (lastTelemetry.TryGetValue(deviceId, out string? previous) && previous == telemetry) return;
+            lastTelemetry[deviceId] = telemetry;
+        }
+        Log("Device " + deviceId + " battery response: " + Convert.ToHexString(report, 0, Math.Min(report.Length, 21)));
     }
 
     internal static BatteryReading Parse(byte[] report, ushort productId, bool? wired = null)
@@ -248,10 +367,13 @@ internal sealed class BatteryReader
     {
         try
         {
-            Directory.CreateDirectory(DataDirectory);
-            var path = Path.Combine(DataDirectory, "diagnostic.log");
-            if (File.Exists(path) && new FileInfo(path).Length > 256 * 1024) File.WriteAllText(path, "");
-            File.AppendAllText(path, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+            lock (LogGate)
+            {
+                Directory.CreateDirectory(DataDirectory);
+                var path = Path.Combine(DataDirectory, "diagnostic.log");
+                if (File.Exists(path) && new FileInfo(path).Length > 256 * 1024) File.WriteAllText(path, "");
+                File.AppendAllText(path, $"{DateTimeOffset.Now:O} {message}{Environment.NewLine}");
+            }
         }
         catch { }
     }

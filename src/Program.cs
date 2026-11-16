@@ -10,7 +10,7 @@ internal static class Program
     [STAThread]
     static void Main(string[] args)
     {
-        bool diagnostic = args.Any(a=>a is "--enumerate" or "--diagnose" or "--query" or "--self-test" or "--icon-preview" or "--menu-preview" or "--ui-preview");
+        bool diagnostic = args.Any(a=>a is "--enumerate" or "--diagnose" or "--query" or "--query-all" or "--self-test" or "--icon-preview" or "--menu-preview" or "--ui-preview");
         if (!diagnostic) { Run(args); return; }
         try
         {
@@ -64,6 +64,11 @@ internal static class Program
             new BatteryReader().Read();
             return;
         }
+        if (args.Contains("--query-all"))
+        {
+            File.WriteAllText(DiagnosticPath("devices-status.json"),JsonSerializer.Serialize(new BatteryReader().ReadAll(),new JsonSerializerOptions { WriteIndented=true, Encoder=JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
+            return;
+        }
         if (args.Contains("--self-test"))
         {
             RunParserChecks();
@@ -84,6 +89,8 @@ internal static class Program
         {
             ApplicationConfiguration.Initialize();
             using var popup=new BatteryPopup();
+            popup.SetDisplayOptions(MouseDisplayMode.Fixed, "demo-vgn",
+                [new("demo-vgn", "VGN F2 Pro Max · 2.4G"), new("demo-keychron", "Keychron M5 · 2.4G")], 30, 5);
             popup.SetState(new TrayApp.BatteryView(100,false,"无线使用中",new DateTimeOffset(2026,11,15,12,34,56,TimeSpan.FromHours(8)),"2.4 GHz USB 接收器","VGN DragonFly F2 Pro Max"),false,false,true,true,20);
             popup.PerformLayout();
             using var surface=new Panel { ClientSize=popup.ClientSize, BackColor=popup.BackColor, ForeColor=popup.ForeColor, Font=popup.Font, Padding=popup.Padding };
@@ -101,11 +108,26 @@ internal static class Program
             return;
         }
 #if !HID_PROBE
-        using var mutex = new Mutex(true, @"Local\VgnBattery.Instance", out bool first);
-        using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\VgnBattery.Show");
+#if UI_QA
+        const string instanceName=@"Local\VgnBattery.QA.Instance";
+        const string showName=@"Local\VgnBattery.QA.Show";
+#else
+        const string instanceName=@"Local\VgnBattery.Instance";
+        const string showName=@"Local\VgnBattery.Show";
+#endif
+        using var mutex = new Mutex(true, instanceName, out bool first);
+        using var showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, showName);
         if (!first) { showEvent.Set(); return; }
         ApplicationConfiguration.Initialize();
         using var context = new TrayApp();
+#if UI_QA
+        using var qaTimer = new System.Windows.Forms.Timer { Interval=100 };
+        if (args.Contains("--qa-smoke"))
+        {
+            qaTimer.Tick += async (_,_) => { qaTimer.Stop(); await context.RunQaSmokeAsync(); };
+            qaTimer.Start();
+        }
+#endif
         using var showTimer = new System.Windows.Forms.Timer { Interval=300 };
         showTimer.Tick += (_,_) => { if (showEvent.WaitOne(0)) context.ShowPopup(); };
         showTimer.Start();
@@ -131,7 +153,8 @@ internal static class Program
             frame[20] = (byte)(level | (charging ? 0x80 : 0));
             return frame;
         }
-        void Check(bool success, string label) { if (!success) throw new InvalidDataException(label); }
+        int passedChecks=0;
+        void Check(bool success, string label) { if (!success) throw new InvalidDataException(label); passedChecks++; }
         Check(BatteryReader.Parse(Frame(67,false),0xfb3e).Percent==67,"wireless percent");
         Check(BatteryReader.Parse(Frame(0,false,3300),0xfb3e).Percent==0,"real zero percent");
         Check(BatteryReader.Parse(Frame(38,true),0xfb3d).Charging,"cable charging");
@@ -222,15 +245,18 @@ internal static class Program
         Check(receiverProfile.Matches(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xffc1,1,64,64,0)),"keychron receiver matches its 64-byte collection");
         Check(!receiverProfile.Matches(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xff60,0x61,33,33,0)),"keychron receiver never targets the raw HID collection");
         Check(DeviceCatalog.Model(new HidDevice("",0x3434,0xd028,"Keychron Ultra-Link 8K",0xffc1,1,64,64,0),receiverProfile)=="Keychron Ultra-Link 8K","keychron product name preserved");
-        Check(TrayApp.NormalizePollSeconds(null)==45,"poll interval defaults to 45 seconds");
+        Check(TrayApp.NormalizePollSeconds(null)==30,"poll interval defaults to 30 seconds");
         Check(TrayApp.NormalizePollSeconds(5)==5,"poll interval accepts five seconds");
-        Check(TrayApp.NormalizePollSeconds(600)==45,"poll interval rejects out of range values");
+        Check(TrayApp.NormalizePollSeconds(600)==30,"poll interval rejects out of range values");
+        Check(TrayApp.NormalizePollSeconds(30)==30 && TrayApp.NormalizePollSeconds(120)==120,"poll interval accepts new default and slow option");
+        Check(TrayApp.NormalizePollSeconds(4)==30 && TrayApp.NormalizePollSeconds(7)==30,"poll interval accepts listed choices only");
         var failedResponse=Frame(55,false); failedResponse[2]=1; failedResponse[16]=0; failedResponse[16]=unchecked((byte)(0x55-failedResponse.Sum(b=>(int)b)));
         Check(BatteryReader.Parse(failedResponse,0xfb3e).Percent is null,"error response with valid checksum rejected");
         string shareReport=JsonSerializer.Serialize(DeviceDiagnostics.CreateReport([actualName with { Path="private-device-path-and-serial",VendorId=0x391d,ProductId=0x102d }],[]));
         Check(!shareReport.Contains("private-device-path-and-serial",StringComparison.Ordinal),"share report omits device path and serial");
         Check(shareReport.Contains("391D",StringComparison.Ordinal) && shareReport.Contains("102D",StringComparison.Ordinal),"share report retains model identifiers");
-        File.WriteAllText(DiagnosticPath("self-test.txt"), "Passed 68 protocol, identity, icon, dragging, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
+        MultiDeviceChecks.Run(Check);
+        File.WriteAllText(DiagnosticPath("self-test.txt"), $"Passed {passedChecks} protocol, identity, icon, multi-device, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
     }
 
     private static void RenderIconPreview()
@@ -268,8 +294,13 @@ internal static class Program
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("显示电量数字"){CheckOnClick=true,Checked=true});
         menu.Items.Add(new ToolStripMenuItem("低电通知（低于 20%）"){CheckOnClick=true,Checked=true});
-        var interval = new ToolStripMenuItem("刷新间隔");
-        foreach (int seconds in new[]{5,15,45,120}) interval.DropDownItems.Add(new ToolStripMenuItem($"每 {seconds} 秒"){Checked=seconds==45});
+        var displayMode=new ToolStripMenuItem("显示方式");
+        displayMode.DropDownItems.Add(new ToolStripMenuItem("固定显示"){Checked=true});
+        displayMode.DropDownItems.Add(new ToolStripMenuItem("轮换显示"));
+        displayMode.DropDownItems.Add(new ToolStripMenuItem("平铺显示"));
+        menu.Items.Add(displayMode);
+        var interval = new ToolStripMenuItem("查询间隔");
+        foreach (int seconds in new[]{5,15,30,45,60,120}) interval.DropDownItems.Add(new ToolStripMenuItem($"每 {seconds} 秒"){Checked=seconds==30});
         menu.Items.Add(interval);
         menu.Items.Add(new ToolStripMenuItem("开机自动运行"){CheckOnClick=true,Checked=false});
         menu.Items.Add(new ToolStripSeparator());
