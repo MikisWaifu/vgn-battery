@@ -63,7 +63,15 @@ internal sealed class StyledChoiceButton : Button
             };
             dropdown.Items.Add(item);
         }
-        dropdown.Closed += (_, _) => { if (openMenu == dropdown) openMenu = null; dropdown.Dispose(); };
+        dropdown.Closed += (_, _) =>
+        {
+            if (openMenu == dropdown) openMenu = null;
+            // Choosing an option can resize the popup, which closes this drop-down
+            // while it is still running its own click handling. Disposing it here
+            // makes that handling touch a dead object, so wait for the message loop.
+            if (IsHandleCreated && !IsDisposed) BeginInvoke(new Action(dropdown.Dispose));
+            else dropdown.Dispose();
+        };
         openMenu = dropdown;
         dropdown.Show(this, new Point(0, Height));
     }
