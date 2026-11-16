@@ -328,6 +328,9 @@ internal sealed class TrayApp : ApplicationContext
         }
         try
         {
+            timer.Stop();
+            // The normal startup poll may still be completing on a slow runner.
+            while (refreshing) await Task.Delay(10);
             await RefreshAsync();
             SetDisplayMode(MouseDisplayMode.Fixed);
             SetFixedTarget("qa-b");
@@ -346,6 +349,8 @@ internal sealed class TrayApp : ApplicationContext
             UpdateDisplay();
             Check(icons.Keys.Single() != before && ReferenceEquals(reusable, icons.Values.Single()), "rotation reuses the shell icon");
             Check(display.GetDetails(detailsDeviceId).DeviceId == "qa-a", "rotation keeps details pinned");
+            SetPollSeconds(30);
+            SetRotateSeconds(5);
             SetPollSeconds(120);
             SetRotateSeconds(3);
             Check(timer.Interval == 120000 && rotationTimer.Interval == 3000, "query and rotation intervals are independent");
