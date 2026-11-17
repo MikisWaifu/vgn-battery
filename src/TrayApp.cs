@@ -579,6 +579,7 @@ internal sealed class TrayApp : ApplicationContext
             var reading = details.Reading;
             popup.SetState(new(reading.Percent, reading.Charging, reading.Message, reading.Timestamp, reading.Transport, reading.Model, details.Stale),
                 refreshing, startupEnabled, showPercentage, lowBatteryEnabled, lowBatteryThreshold);
+            popup.SetOtherDevices(details.DeviceId, display.Devices);
         }
     }
 
@@ -718,6 +719,9 @@ internal sealed class BatteryPopup : Form
     private readonly StyledChoiceButton pollChoice;
     private readonly StyledChoiceButton rotationChoice;
     private readonly BatteryCanvas battery;
+    private readonly TableLayoutPanel contentLayout;
+    private readonly OtherDevicesPanel otherDevices;
+    private readonly Panel viewport;
     private bool settingState;
     public event EventHandler? StartupRequested;
     public event EventHandler? PercentageRequested;
@@ -749,6 +753,9 @@ internal sealed class BatteryPopup : Form
         ClientSize = new Size(350, 574);
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
+#if UI_QA
+        ShowInTaskbar = true;
+#endif
         StartPosition = FormStartPosition.Manual;
         TopMost = true;
         BackColor = Background;
@@ -758,14 +765,15 @@ internal sealed class BatteryPopup : Form
         Padding = new Padding(20);
         Text = "鼠标电量";
 
-        var layout = new TableLayoutPanel
+        contentLayout = new TableLayoutPanel
         {
-            Dock = DockStyle.Top, Height = 534, ColumnCount = 1, RowCount = 7,
+            Dock = DockStyle.Top, Height = 534, ColumnCount = 1, RowCount = 8,
             Margin = Padding.Empty, Padding = Padding.Empty, BackColor = Background
         };
+        var layout = contentLayout;
         layout.SuspendLayout();
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        foreach (int height in new[] { 32, 26, 86, 36, 22, 314, 18 })
+        foreach (int height in new[] { 32, 26, 86, 36, 22, 0, 314, 18 })
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
 
         var heading = new TableLayoutPanel
@@ -838,6 +846,12 @@ internal sealed class BatteryPopup : Form
         updated.ForeColor = Secondary;
         updated.TextAlign = ContentAlignment.MiddleLeft;
         layout.Controls.Add(updated, 0, 4);
+        otherDevices = new OtherDevicesPanel
+        {
+            Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = Background,
+            ForeColor = ForeColor, Font = Font, Visible = false
+        };
+        layout.Controls.Add(otherDevices, 0, 5);
         var settingsCard = new SettingsCard
         {
             Dock = DockStyle.Fill, Padding = new Padding(10), Margin = new Padding(0, 8, 0, 0)
@@ -913,12 +927,12 @@ internal sealed class BatteryPopup : Form
         rotationChoice.SelectionChanged += (_, _) => { if (!settingState) RotationRequested?.Invoke(this, EventArgs.Empty); };
         AddChoiceRow(settings, 8, "轮换间隔", rotationChoice);
         settingsCard.Controls.Add(settings);
-        layout.Controls.Add(settingsCard, 0, 5);
+        layout.Controls.Add(settingsCard, 0, 6);
         hint = MakeLabel("自动查询 · 每 30 秒", 8F);
         hint.ForeColor = Color.FromArgb(113, 125, 143);
         hint.TextAlign = ContentAlignment.MiddleLeft;
-        layout.Controls.Add(hint, 0, 6);
-        var viewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Background, Margin = Padding.Empty };
+        layout.Controls.Add(hint, 0, 7);
+        viewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Background, Margin = Padding.Empty };
         viewport.Controls.Add(layout);
         Controls.Add(viewport);
 
@@ -927,7 +941,7 @@ internal sealed class BatteryPopup : Form
         KeyDown += (_, e) => { if (e.KeyCode == Keys.Escape) Hide(); };
         FormClosing += (_, e) => { if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); } };
         Shown += (_, _) => WriteLayoutDiagnostics();
-        DpiChanged += (_, _) => BeginInvoke(WriteLayoutDiagnostics);
+        DpiChanged += (_, _) => BeginInvoke(() => { UpdateOtherDevicesLayout(); WriteLayoutDiagnostics(); });
 
         // Establish a single scaling baseline only after every child has been added.
         AutoScaleDimensions = new SizeF(96, 96);
@@ -938,6 +952,41 @@ internal sealed class BatteryPopup : Form
         ResumeLayout(true);
         SetDisplayOptions(MouseDisplayMode.Fixed, "", [new ChoiceOption("", "等待鼠标连接", false)], TrayApp.DefaultPollSeconds, TrayApp.DefaultRotateSeconds);
         WriteLayoutDiagnostics();
+    }
+
+    public void SetOtherDevices(string currentDeviceId, IReadOnlyList<MouseBattery> devices)
+    {
+        if (IsDisposed) return;
+        int previousCount = otherDevices.Rows.Count;
+        if (otherDevices.SetDevices(currentDeviceId, devices) && previousCount != otherDevices.Rows.Count)
+            UpdateOtherDevicesLayout();
+    }
+
+    private int DesiredPopupHeight => (int)Math.Round((574 + OtherDevicesPanel.LogicalHeightForRows(otherDevices.Rows.Count)) * DeviceDpi / 96F);
+
+    private void UpdateOtherDevicesLayout()
+    {
+        if (IsDisposed) return;
+        int listHeight = (int)Math.Round(OtherDevicesPanel.LogicalHeightForRows(otherDevices.Rows.Count) * DeviceDpi / 96F);
+        contentLayout.SuspendLayout();
+        contentLayout.RowStyles[5].Height = listHeight;
+        contentLayout.Height = (int)Math.Round(534 * DeviceDpi / 96F) + listHeight;
+        otherDevices.Visible = listHeight > 0;
+        contentLayout.ResumeLayout(true);
+
+        // Opening positions are handled separately. Refreshes retain a dragged
+        // window's location and only clamp its growing bounds to the same screen.
+        if (!Visible) { Height = DesiredPopupHeight; return; }
+        FitToWorkingArea(Screen.FromRectangle(Bounds).WorkingArea);
+    }
+
+    private void FitToWorkingArea(Rectangle area)
+    {
+        int margin = (int)Math.Round(12 * DeviceDpi / 96F);
+        Height = Math.Min(DesiredPopupHeight, Math.Max(200, area.Height - margin * 2));
+        int left = Math.Clamp(Left, area.Left + margin, Math.Max(area.Left + margin, area.Right - Width - margin));
+        int top = Math.Clamp(Top, area.Top + margin, Math.Max(area.Top + margin, area.Bottom - Height - margin));
+        Location = new Point(left, top);
     }
 
     public void SetDisplayOptions(MouseDisplayMode mode, string fixedId, IReadOnlyList<ChoiceOption> devices, int pollSeconds, int rotateSeconds)
@@ -1000,7 +1049,7 @@ internal sealed class BatteryPopup : Form
         var screen = Screen.FromPoint(cursor);
         var area = screen.WorkingArea;
         int margin = (int)Math.Round(12 * DeviceDpi / 96F);
-        int desiredHeight = (int)Math.Round(574 * DeviceDpi / 96F);
+        int desiredHeight = DesiredPopupHeight;
         Height = Math.Min(desiredHeight, Math.Max(200, area.Height - margin * 2));
         int x = Math.Clamp(cursor.X - Width + margin * 2, area.Left + margin, Math.Max(area.Left + margin, area.Right - Width - margin));
         int y = cursor.Y < area.Top + margin * 2 ? area.Top + margin : area.Bottom - Height - margin;

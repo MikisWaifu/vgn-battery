@@ -91,7 +91,20 @@ internal static class Program
             using var popup=new BatteryPopup();
             popup.SetDisplayOptions(MouseDisplayMode.Fixed, "demo-vgn",
                 [new("demo-vgn", "VGN F2 Pro Max · 2.4G"), new("demo-keychron", "Keychron M5 · 2.4G")], 30, 5);
-            popup.SetState(new TrayApp.BatteryView(100,false,"无线使用中",new DateTimeOffset(2026,11,15,12,34,56,TimeSpan.FromHours(8)),"2.4 GHz USB 接收器","VGN DragonFly F2 Pro Max"),false,false,true,true,20);
+            var previewTime=new DateTimeOffset(2026,11,17,12,34,56,TimeSpan.FromHours(8));
+            popup.SetState(new TrayApp.BatteryView(100,false,"无线使用中",previewTime,"2.4 GHz USB 接收器","VGN DragonFly F2 Pro Max"),false,false,true,true,20);
+            var previewDevices=new List<MouseBattery>
+            {
+                new("demo-vgn",new(100,false,"",previewTime,"2.4 GHz USB 接收器","VGN DragonFly F2 Pro Max"))
+            };
+            if (!args.Contains("--preview-one"))
+                previewDevices.Add(new("demo-keychron",new(95,false,"",previewTime,"2.4 GHz USB 接收器","Keychron M5")));
+            if (args.Contains("--preview-many"))
+            {
+                previewDevices.Add(new("demo-history",new(42,false,"",previewTime,"USB 有线","VXE R1 Pro"),true));
+                previewDevices.Add(new("demo-unknown",new(null,false,"",previewTime,"2.4 GHz USB 接收器","VGN Mouse 2.4G Receiver · 长名称示例"),true));
+            }
+            popup.SetOtherDevices("demo-vgn",previewDevices);
             popup.PerformLayout();
             using var surface=new Panel { ClientSize=popup.ClientSize, BackColor=popup.BackColor, ForeColor=popup.ForeColor, Font=popup.Font, Padding=popup.Padding };
             surface.CreateControl();
@@ -124,7 +137,36 @@ internal static class Program
         using var qaTimer = new System.Windows.Forms.Timer { Interval=100 };
         if (args.Contains("--qa-smoke"))
         {
-            qaTimer.Tick += async (_,_) => { qaTimer.Stop(); await context.RunQaSmokeAsync(); };
+            qaTimer.Tick += async (_,_) =>
+            {
+                qaTimer.Stop();
+                string qaDirectory=Path.Combine(AppContext.BaseDirectory,"qa-data");
+                Directory.CreateDirectory(qaDirectory);
+                try
+                {
+                    int menuChecks=0;
+                    await DropdownChecks.RunAsync((success,label) =>
+                    {
+                        if (!success) throw new InvalidDataException(label);
+                        menuChecks++;
+                    });
+                    File.WriteAllText(Path.Combine(qaDirectory,"dropdown.txt"),$"Passed {menuChecks} menu lifecycle checks using actual WinForms click handling.");
+                    int layoutChecks=0;
+                    await PopupLayoutChecks.RunAsync((success,label) =>
+                    {
+                        if (!success) throw new InvalidDataException(label);
+                        layoutChecks++;
+                    });
+                    File.WriteAllText(Path.Combine(qaDirectory,"layout-checks.txt"),$"Passed {layoutChecks} popup layout checks with a real window and message loop.");
+                    await context.RunQaSmokeAsync();
+                }
+                catch (Exception ex)
+                {
+                    Environment.ExitCode=1;
+                    File.WriteAllText(Path.Combine(qaDirectory,"dropdown.txt"),ex.ToString());
+                    context.ExitThread();
+                }
+            };
             qaTimer.Start();
         }
 #endif
@@ -267,6 +309,7 @@ internal static class Program
         Check(!shareReport.Contains("private-device-path-and-serial",StringComparison.Ordinal),"share report omits device path and serial");
         Check(shareReport.Contains("391D",StringComparison.Ordinal) && shareReport.Contains("102D",StringComparison.Ordinal),"share report retains model identifiers");
         MultiDeviceChecks.Run(Check);
+        OtherDeviceChecks.Run(Check);
         File.WriteAllText(DiagnosticPath("self-test.txt"), $"Passed {passedChecks} protocol, identity, icon, multi-device, settings, startup, diagnostics and low battery policy checks. These are offline checks, not hardware validation.");
     }
 
